@@ -17,7 +17,22 @@ type MetaData struct {
 	keys    []Key
 	decoded map[string]struct{}
 	data    []byte // Input file; for errors.
+
+	session   *Session               // Consumption tracking for this document.
+	node      *declNode              // Current declaration; used during decoding.
+	nodeStack []*declNode            // Declaration cursor stack; used during decoding.
+	readSet   map[*declNode]struct{} // Non-nil while decoding inside a Session.
 }
+
+// Session returns the consumption tracking session for this document.
+//
+// The session records which declarations were consumed by decoding, which
+// were never attempted, and which decode attempts failed, addressed by
+// declaration identity (including tables array element indices) rather than
+// by key name alone. See [Session] for details.
+//
+// It returns nil for a zero MetaData.
+func (md *MetaData) Session() *Session { return md.session }
 
 // IsDefined reports if the key exists in the TOML data.
 //

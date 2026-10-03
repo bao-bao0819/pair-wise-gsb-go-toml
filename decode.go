@@ -71,6 +71,7 @@ func DecodeFS(fsys fs.FS, path string, v any) (MetaData, error) {
 type Primitive struct {
 	undecoded any
 	context   Key
+	node      *declNode
 }
 
 // The significand precision for float32 and float64 is 24 and 53 bits; this is
@@ -184,6 +185,8 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		context: nil,
 		data:    data,
 	}
+	md.session = newSession(p.mapping, p.ordered, p.keyInfo, data)
+	md.node = md.session.root
 	return md, md.unify(p.mapping, rv)
 }
 
@@ -199,8 +202,72 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 // undecoded keys in the meta data. (See the example.)
 func (md *MetaData) PrimitiveDecode(primValue Primitive, v any) error {
 	md.context = primValue.context
-	defer func() { md.context = nil }()
+	md.node = primValue.node
+	defer func() { md.context, md.node = nil, nil }()
 	return md.unify(primValue.undecoded, rvalue(v))
+}
+
+// enterKey descends into the declaration for key: it records the key as
+// decoded and, when a session is attached, moves the declaration cursor to
+// the key's node. In session decode mode (readSet != nil) the node is
+// collected into the receipt's read set instead of being marked consumed.
+func (md *MetaData) enterKey(key string) {
+	md.context = append(md.context, key)
+	if md.session == nil {
+		md.decoded[md.context.String()] = struct{}{}
+		return
+	}
+	prev := md.node
+	md.nodeStack = append(md.nodeStack, prev)
+	var child *declNode
+	if prev != nil {
+		child = prev.children[key]
+	}
+	md.node = child
+	if md.readSet != nil {
+		if child != nil {
+			md.readSet[child] = struct{}{}
+		}
+		return
+	}
+	md.decoded[md.context.String()] = struct{}{}
+	if child != nil {
+		child.state = DeclConsumed
+		child.err = nil
+	}
+}
+
+// enterElem descends into the i-th element of a slice value. Only elements
+// of tables arrays have their own declarations; for plain arrays the
+// declaration of the array key itself stays in effect.
+func (md *MetaData) enterElem(i int) {
+	if md.session == nil {
+		return
+	}
+	prev := md.node
+	md.nodeStack = append(md.nodeStack, prev)
+	if prev == nil || i >= len(prev.elems) {
+		return
+	}
+	md.node = prev.elems[i]
+	if md.readSet != nil {
+		md.readSet[md.node] = struct{}{}
+		return
+	}
+	md.node.state = DeclConsumed
+	md.node.err = nil
+}
+
+func (md *MetaData) leave() {
+	md.context = md.context[:len(md.context)-1]
+	md.leaveNode()
+}
+
+func (md *MetaData) leaveNode() {
+	if n := len(md.nodeStack); n > 0 {
+		md.node = md.nodeStack[n-1]
+		md.nodeStack = md.nodeStack[:n-1]
+	}
 }
 
 // markDecodedRecursive is a helper to mark any key under the given tmap as
@@ -239,7 +306,19 @@ func (md *MetaData) unify(data any, rv reflect.Value) error {
 		rv.Set(reflect.ValueOf(Primitive{
 			undecoded: data,
 			context:   context,
+			node:      md.node,
 		}))
+		// The declarations behind a Primitive are not consumed yet: they
+		// become consumed only when the Primitive is decoded and, for a
+		// session decode, its receipt is accepted. Undo the consumption
+		// recorded when this value was entered.
+		if md.node != nil {
+			if md.readSet != nil {
+				delete(md.readSet, md.node)
+			} else {
+				md.node.state = DeclPending
+			}
+		}
 		return nil
 	}
 
@@ -249,8 +328,19 @@ func (md *MetaData) unify(data any, rv reflect.Value) error {
 		if err != nil {
 			return md.parseErr(err)
 		}
-		// Assume the Unmarshaler decoded everything, so mark all keys under
-		// this table as decoded.
+		// Assume the Unmarshaler decoded everything, so mark all keys
+		// under this table as decoded. A custom Unmarshaler takes over its
+		// entire scope: the session marks the whole subtree as consumed
+		// rather than guessing which fields were read.
+		if md.readSet != nil {
+			if md.node != nil {
+				md.node.addSubtree(md.readSet)
+			}
+			return nil
+		}
+		if md.node != nil {
+			md.node.consumeSubtree()
+		}
 		if tmap, ok := data.(map[string]any); ok {
 			markDecodedRecursive(md, tmap)
 		}
@@ -331,14 +421,12 @@ func (md *MetaData) unifyStruct(mapping any, rv reflect.Value) error {
 			}
 
 			if isUnifiable(subv) {
-				md.decoded[md.context.add(key).String()] = struct{}{}
-				md.context = append(md.context, key)
-
+				md.enterKey(key)
 				err := md.unify(datum, subv)
 				if err != nil {
 					return err
 				}
-				md.context = md.context[0 : len(md.context)-1]
+				md.leave()
 			} else if f.name != "" {
 				return md.e("cannot write unexported field %s.%s", rv.Type().String(), f.name)
 			}
@@ -365,8 +453,7 @@ func (md *MetaData) unifyMap(mapping any, rv reflect.Value) error {
 		rv.Set(reflect.MakeMap(rv.Type()))
 	}
 	for k, v := range tmap {
-		md.decoded[md.context.add(k).String()] = struct{}{}
-		md.context = append(md.context, k)
+		md.enterKey(k)
 
 		rvval := reflect.Indirect(reflect.New(rv.Type().Elem()))
 
@@ -374,7 +461,7 @@ func (md *MetaData) unifyMap(mapping any, rv reflect.Value) error {
 		if err != nil {
 			return err
 		}
-		md.context = md.context[0 : len(md.context)-1]
+		md.leave()
 
 		rvkey := indirect(reflect.New(rv.Type().Key()))
 
@@ -423,10 +510,12 @@ func (md *MetaData) unifySlice(data any, rv reflect.Value) error {
 func (md *MetaData) unifySliceArray(data, rv reflect.Value) error {
 	l := data.Len()
 	for i := 0; i < l; i++ {
+		md.enterElem(i)
 		err := md.unify(data.Index(i).Interface(), indirect(rv.Index(i)))
 		if err != nil {
 			return err
 		}
+		md.leaveNode()
 	}
 	return nil
 }
