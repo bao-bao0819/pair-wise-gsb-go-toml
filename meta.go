@@ -17,6 +17,21 @@ type MetaData struct {
 	keys    []Key
 	decoded map[string]struct{}
 	data    []byte // Input file; for errors.
+
+	// Document identity stamped on every Primitive, so receipts can't be
+	// replayed against an identically named but different document.
+	docID uint64
+
+	// Full identity (including array-of-tables indices) of the value
+	// currently being decoded.
+	idPath DeclPath
+
+	// Active consumption tracker; nil unless decoding for a ConsumeSession.
+	tracker *consumeTracker
+
+	// Declarations read during the initial Decode, used to seed new sessions.
+	baseRead   []DeclPath
+	baseOpaque []DeclPath
 }
 
 // IsDefined reports if the key exists in the TOML data.

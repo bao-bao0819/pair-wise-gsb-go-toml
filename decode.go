@@ -71,6 +71,11 @@ func DecodeFS(fsys fs.FS, path string, v any) (MetaData, error) {
 type Primitive struct {
 	undecoded any
 	context   Key
+
+	// Identity of the declaration this Primitive was captured at, and the
+	// document it belongs to. Both are private to the package.
+	id    DeclPath
+	docID uint64
 }
 
 // The significand precision for float32 and float64 is 24 and 53 bits; this is
@@ -183,8 +188,21 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		decoded: make(map[string]struct{}, len(p.ordered)),
 		context: nil,
 		data:    data,
+		docID:   nextDocID(),
 	}
-	return md, md.unify(p.mapping, rv)
+
+	// Record the declarations consumed by the initial decode so that
+	// independently created ConsumeSessions can be seeded with them.
+	base := newConsumeTracker()
+	md.tracker = base
+	err = md.unify(p.mapping, rv)
+	if err == nil {
+		nodes := buildDeclarations(&md)
+		md.baseRead = orderedPaths(base.read, nodes)
+		md.baseOpaque = orderedPaths(base.opaque, nodes)
+	}
+	md.tracker = nil
+	return md, err
 }
 
 // PrimitiveDecode is just like the other Decode* functions, except it decodes a
@@ -200,6 +218,12 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 func (md *MetaData) PrimitiveDecode(primValue Primitive, v any) error {
 	md.context = primValue.context
 	defer func() { md.context = nil }()
+	// Legacy decode: consumption sessions are unaffected, but idPath still
+	// lets nested Primitive values inherit a correct identity.
+	if primValue.docID == md.docID {
+		md.idPath = clonePath(primValue.id)
+		defer func() { md.idPath = nil }()
+	}
 	return md.unify(primValue.undecoded, rvalue(v))
 }
 
@@ -236,9 +260,19 @@ func (md *MetaData) unify(data any, rv reflect.Value) error {
 		// value.
 		context := make(Key, len(md.context))
 		copy(context, md.context)
+		var id DeclPath
+		if len(md.idPath) > 0 {
+			id = clonePath(md.idPath)
+		} else {
+			id = pathFromKey(context)
+		}
+		// A Primitive hides everything beneath it, so it's not consumed itself.
+		md.tracker.remove(id)
 		rv.Set(reflect.ValueOf(Primitive{
 			undecoded: data,
 			context:   context,
+			id:        id,
+			docID:     md.docID,
 		}))
 		return nil
 	}
@@ -247,8 +281,14 @@ func (md *MetaData) unify(data any, rv reflect.Value) error {
 	if v, ok := rvi.(Unmarshaler); ok {
 		err := v.UnmarshalTOML(data)
 		if err != nil {
+			if md.tracker != nil && len(md.idPath) > 0 {
+				md.tracker.fail = clonePath(md.idPath)
+			}
 			return md.parseErr(err)
 		}
+		// The Unmarshaler takes over the whole value opaquely; internal field
+		// reads can't be inferred, so only record the root.
+		md.tracker.recordOpaque(md.idPath)
 		// Assume the Unmarshaler decoded everything, so mark all keys under
 		// this table as decoded.
 		if tmap, ok := data.(map[string]any); ok {
@@ -333,12 +373,19 @@ func (md *MetaData) unifyStruct(mapping any, rv reflect.Value) error {
 			if isUnifiable(subv) {
 				md.decoded[md.context.add(key).String()] = struct{}{}
 				md.context = append(md.context, key)
+				md.idPath = append(md.idPath, pathStep{key: key, arrIndex: -1})
+				md.tracker.record(md.idPath)
+				failPath := clonePath(md.idPath)
 
 				err := md.unify(datum, subv)
+				md.context = md.context[0 : len(md.context)-1]
+				md.idPath = md.idPath[0 : len(md.idPath)-1]
 				if err != nil {
+					if md.tracker != nil && len(md.tracker.fail) == 0 {
+						md.tracker.fail = failPath
+					}
 					return err
 				}
-				md.context = md.context[0 : len(md.context)-1]
 			} else if f.name != "" {
 				return md.e("cannot write unexported field %s.%s", rv.Type().String(), f.name)
 			}
@@ -367,14 +414,21 @@ func (md *MetaData) unifyMap(mapping any, rv reflect.Value) error {
 	for k, v := range tmap {
 		md.decoded[md.context.add(k).String()] = struct{}{}
 		md.context = append(md.context, k)
+		md.idPath = append(md.idPath, pathStep{key: k, arrIndex: -1})
+		md.tracker.record(md.idPath)
+		failPath := clonePath(md.idPath)
 
 		rvval := reflect.Indirect(reflect.New(rv.Type().Elem()))
 
 		err := md.unify(v, indirect(rvval))
+		md.context = md.context[0 : len(md.context)-1]
+		md.idPath = md.idPath[0 : len(md.idPath)-1]
 		if err != nil {
+			if md.tracker != nil && len(md.tracker.fail) == 0 {
+				md.tracker.fail = failPath
+			}
 			return err
 		}
-		md.context = md.context[0 : len(md.context)-1]
 
 		rvkey := indirect(reflect.New(rv.Type().Key()))
 
@@ -422,11 +476,30 @@ func (md *MetaData) unifySlice(data any, rv reflect.Value) error {
 
 func (md *MetaData) unifySliceArray(data, rv reflect.Value) error {
 	l := data.Len()
+	_, isAoT := data.Interface().([]map[string]any)
+	if isAoT {
+		// The container key isn't a declaration node; the elements are.
+		md.tracker.remove(md.idPath)
+	}
 	for i := 0; i < l; i++ {
+		if isAoT && len(md.idPath) > 0 {
+			md.idPath[len(md.idPath)-1].arrIndex = i
+			md.tracker.record(md.idPath)
+		}
+		failPath := clonePath(md.idPath)
 		err := md.unify(data.Index(i).Interface(), indirect(rv.Index(i)))
 		if err != nil {
+			if md.tracker != nil && len(md.tracker.fail) == 0 {
+				md.tracker.fail = failPath
+			}
+			if isAoT && len(md.idPath) > 0 {
+				md.idPath[len(md.idPath)-1].arrIndex = -1
+			}
 			return err
 		}
+	}
+	if isAoT && len(md.idPath) > 0 {
+		md.idPath[len(md.idPath)-1].arrIndex = -1
 	}
 	return nil
 }
