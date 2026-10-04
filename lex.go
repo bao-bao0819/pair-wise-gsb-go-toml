@@ -67,6 +67,13 @@ type lexer struct {
 	// arrays. The last state on the stack is used after a value has been lexed.
 	// Similarly for comments.
 	stack []stateFn
+
+	// TOML version to parse as, and the TOML 1.1 features encountered so
+	// far. itComma records the position of the last ',' seen in an inline
+	// table, to report trailing commas.
+	version  Version
+	features []Feature
+	itComma  Position
 }
 
 type item struct {
@@ -88,15 +95,41 @@ func (lx *lexer) nextItem() item {
 	}
 }
 
-func lex(input string) *lexer {
+func lex(input string, version Version) *lexer {
 	lx := &lexer{
 		input: input,
 		state: lexTop,
 		items: make(chan item, 10),
 		stack: make([]stateFn, 0, 10),
 		line:  1,
+
+		version: version,
 	}
 	return lx
+}
+
+// feature records the use of a TOML feature that requires a version newer
+// than TOML 1.0 at pos. If the lexer is configured to parse as an older
+// version it emits a version error instead and returns false, in which case
+// the caller should stop lexing by returning nil.
+func (lx *lexer) feature(kind FeatureKind, pos Position) bool {
+	if lx.version < kind.Since() {
+		lx.items <- item{typ: itemError, pos: pos, err: errVersion{kind: kind, version: lx.version}}
+		return false
+	}
+	lx.features = append(lx.features, Feature{Kind: kind, Position: pos})
+	return true
+}
+
+// inlineTableNewline records a newline inside an inline table. It assumes the
+// newline has just been consumed with next().
+func (lx *lexer) inlineTableNewline() bool {
+	pos := Position{Line: lx.line, Start: lx.pos - 1, Len: 1}
+	if lx.input[lx.pos-1] == '\n' {
+		// lx.line was already incremented when the '\n' was consumed.
+		pos.Line--
+	}
+	return lx.feature(FeatureInlineTableNewline, pos)
 }
 
 func (lx *lexer) push(state stateFn) {
@@ -624,6 +657,9 @@ func lexInlineTableValue(lx *lexer) stateFn {
 	case isWhitespace(r):
 		return lexSkip(lx, lexInlineTableValue)
 	case isNL(r):
+		if !lx.inlineTableNewline() {
+			return nil
+		}
 		return lexSkip(lx, lexInlineTableValue)
 	case r == '#':
 		lx.push(lexInlineTableValue)
@@ -646,22 +682,49 @@ func lexInlineTableValueEnd(lx *lexer) stateFn {
 	case isWhitespace(r):
 		return lexSkip(lx, lexInlineTableValueEnd)
 	case isNL(r):
+		if !lx.inlineTableNewline() {
+			return nil
+		}
 		return lexSkip(lx, lexInlineTableValueEnd)
 	case r == '#':
 		lx.push(lexInlineTableValueEnd)
 		return lexCommentStart
 	case r == ',':
 		lx.ignore()
-		lx.skip(isWhitespace)
-		if lx.peek() == '}' {
-			return lexInlineTableValueEnd
-		}
-		return lexInlineTableValue
+		lx.itComma = Position{Line: lx.line, Start: lx.pos - 1, Len: 1}
+		return lexInlineTableComma
 	case r == '}':
 		return lexInlineTableEnd
 	default:
 		return lx.errorf("expected a comma or an inline table terminator '}', but got %s instead", runeOrEOF(r))
 	}
+}
+
+// lexInlineTableComma is entered after a ',' in an inline table. It skips
+// whitespace, newlines, and comments, and either continues with the next
+// key/value pair or ends the table on '}' (a trailing comma, which requires
+// TOML 1.1).
+func lexInlineTableComma(lx *lexer) stateFn {
+	r := lx.next()
+	switch {
+	case isWhitespace(r):
+		return lexSkip(lx, lexInlineTableComma)
+	case isNL(r):
+		if !lx.inlineTableNewline() {
+			return nil
+		}
+		return lexSkip(lx, lexInlineTableComma)
+	case r == '#':
+		lx.push(lexInlineTableComma)
+		return lexCommentStart
+	case r == '}':
+		if !lx.feature(FeatureInlineTableTrailingComma, lx.itComma) {
+			return nil
+		}
+		return lexInlineTableEnd
+	}
+	lx.backup()
+	return lexInlineTableValue
 }
 
 func runeOrEOF(r rune) string {
@@ -842,7 +905,17 @@ func lexStringEscape(lx *lexer) stateFn {
 	r := lx.next()
 	switch r {
 	case 'e':
-		fallthrough
+		// The '\e' escape sequence requires TOML 1.1.
+		if !lx.feature(FeatureEscapeE, Position{Line: lx.line, Start: lx.pos - 2, Len: 2}) {
+			return nil
+		}
+		return lx.pop()
+	case 'x':
+		// The '\xHH' escape sequence requires TOML 1.1.
+		if !lx.feature(FeatureEscapeX, Position{Line: lx.line, Start: lx.pos - 2, Len: 2}) {
+			return nil
+		}
+		return lexHexEscape
 	case 'b':
 		fallthrough
 	case 't':
@@ -861,8 +934,6 @@ func lexStringEscape(lx *lexer) stateFn {
 		fallthrough
 	case '\\':
 		return lx.pop()
-	case 'x':
-		return lexHexEscape
 	case 'u':
 		return lexShortUnicodeEscape
 	case 'U':

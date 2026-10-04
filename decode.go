@@ -120,12 +120,23 @@ const (
 type Decoder struct {
 	r        io.Reader
 	maxDepth int
+	version  Version
 }
 
 // NewDecoder creates a new Decoder.
 func NewDecoder(r io.Reader) *Decoder {
 	return &Decoder{r: r, maxDepth: 128}
 }
+
+// Version sets the TOML specification version to parse the document as.
+//
+// The default is [VersionLatest]: the latest version this library supports.
+// When set to [Version10], any TOML 1.1 feature (such as '\e' or '\xHH'
+// escapes, times without seconds, or newlines and trailing commas in inline
+// tables) is reported as an error explaining which feature requires the newer
+// version. Use [CheckVersion] to find out which version a document needs
+// without decoding it.
+func (dec *Decoder) Version(v Version) { dec.version = v }
 
 // MaxDepth sets the maximum table and array depth to prevent using an
 // inordinate amount of system resources on deeply nested objects.
@@ -171,7 +182,7 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		return MetaData{}, err
 	}
 
-	p, err := parse(string(data), dec.maxDepth)
+	p, err := parse(string(data), dec.maxDepth, dec.version)
 	if err != nil {
 		return MetaData{}, err
 	}

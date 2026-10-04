@@ -201,6 +201,10 @@ type (
 		size string // "float32" or "float64"
 	}
 	errParseDuration struct{ d string }
+	errVersion       struct {
+		kind    FeatureKind
+		version Version
+	}
 )
 
 func (e errLexControl) Error() string {
@@ -231,6 +235,12 @@ func (e errUnsafeFloat) Error() string {
 func (e errUnsafeFloat) Usage() string   { return usageUnsafeFloat }
 func (e errParseDuration) Error() string { return fmt.Sprintf("invalid duration: %q", e.d) }
 func (e errParseDuration) Usage() string { return usageDuration }
+
+func (e errVersion) Error() string {
+	return fmt.Sprintf("%s requires TOML %s, but this document is parsed as TOML %s",
+		e.kind, e.kind.Since(), e.version)
+}
+func (e errVersion) Usage() string { return usageVersion }
 
 const usageEscape = `
 A '\' inside a "-delimited string is interpreted as an escape character.
@@ -328,4 +338,23 @@ The seconds part in times is optional, and may be omitted:
     2006-01-02T15:04Z07:00
     2006-01-02T15:04
     15:04
+`
+
+const usageVersion = `
+This document uses a feature introduced in a newer version of TOML than the
+version it is parsed as.
+
+Either parse the document as the newer TOML version:
+
+    dec := toml.NewDecoder(r) // TOML 1.1 is the default
+
+or, if the document must stay compatible with TOML 1.0, remove the feature:
+
+    - replace '\e' and '\xHH' escape sequences with '\u001B', '\u00HH', or
+      literal characters;
+    - write times and datetimes with seconds: "07:32:00" instead of "07:32";
+    - keep inline tables on a single line without a trailing comma:
+      "t = {a = 1, b = 2}".
+
+toml.CheckVersion() lists all TOML 1.1 features used in a document.
 `

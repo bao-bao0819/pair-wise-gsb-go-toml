@@ -30,7 +30,7 @@ type keyInfo struct {
 	tomlType tomlType
 }
 
-func parse(data string, maxDepth int) (p *parser, err error) {
+func parse(data string, maxDepth int, version Version) (p *parser, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if pErr, ok := r.(ParseError); ok {
@@ -41,6 +41,9 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 			panic(r)
 		}
 	}()
+	if version == 0 {
+		version = VersionLatest
+	}
 
 	// Read over BOM; do this here as the lexer calls utf8.DecodeRuneInString()
 	// which mangles stuff. UTF-16 BOM isn't strictly valid, but some tools add
@@ -64,7 +67,7 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 	}
 
 	p = &parser{
-		lx:        lex(data),
+		lx:        lex(data, version),
 		maxDepth:  maxDepth,
 		keyInfo:   make(map[string]keyInfo),
 		mapping:   make(map[string]any),
@@ -343,14 +346,17 @@ func (p *parser) valueFloat(it item) (any, tomlType) {
 var dtTypes = []struct {
 	fmt  string
 	zone *time.Location
+	v11  bool // This format requires TOML 1.1.
 }{
-	{time.RFC3339Nano, time.Local},
-	{"2006-01-02T15:04:05.999999999", internal.LocalDatetime},
-	{"2006-01-02", internal.LocalDate},
-	{"15:04:05.999999999", internal.LocalTime},
-	{"2006-01-02T15:04Z07:00", time.Local},
-	{"2006-01-02T15:04", internal.LocalDatetime},
-	{"15:04", internal.LocalTime},
+	{time.RFC3339Nano, time.Local, false},
+	{"2006-01-02T15:04:05.999999999", internal.LocalDatetime, false},
+	{"2006-01-02", internal.LocalDate, false},
+	{"15:04:05.999999999", internal.LocalTime, false},
+
+	// Times and datetimes with the seconds omitted are a TOML 1.1 feature.
+	{"2006-01-02T15:04Z07:00", time.Local, true},
+	{"2006-01-02T15:04", internal.LocalDatetime, true},
+	{"15:04", internal.LocalTime, true},
 }
 
 func (p *parser) valueDatetime(it item) (any, tomlType) {
@@ -363,6 +369,12 @@ func (p *parser) valueDatetime(it item) (any, tomlType) {
 	for _, dt := range dtTypes {
 		t, err = time.ParseInLocation(dt.fmt, it.val, dt.zone)
 		if err == nil {
+			if dt.v11 {
+				if p.lx.version < Version11 {
+					p.panicErr(it, errVersion{kind: FeatureDateTimeNoSeconds, version: p.lx.version})
+				}
+				p.lx.features = append(p.lx.features, Feature{Kind: FeatureDateTimeNoSeconds, Position: it.pos})
+			}
 			if missingLeadingZero(it.val, dt.fmt) {
 				p.panicErr(it, errParseDate{it.val})
 			}
