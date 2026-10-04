@@ -14,6 +14,7 @@ import (
 type parser struct {
 	lx         *lexer
 	maxDepth   int
+	exactNums  bool
 	arrDepth   int
 	context    Key      // Full key for the current hash in scope.
 	currentKey string   // Base key name for everything except hashes.
@@ -30,7 +31,7 @@ type keyInfo struct {
 	tomlType tomlType
 }
 
-func parse(data string, maxDepth int) (p *parser, err error) {
+func parse(data string, maxDepth int, exactNums bool) (p *parser, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if pErr, ok := r.(ParseError); ok {
@@ -66,6 +67,7 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 	p = &parser{
 		lx:        lex(data),
 		maxDepth:  maxDepth,
+		exactNums: exactNums,
 		keyInfo:   make(map[string]keyInfo),
 		mapping:   make(map[string]any),
 		ordered:   make([]Key, 0),
@@ -281,6 +283,19 @@ func (p *parser) valueInteger(it item) (any, tomlType) {
 		p.panicItemf(it, "Invalid integer %q: cannot have leading zeroes", it.val)
 	}
 
+	if p.exactNums {
+		n, err := parseNumberLexeme(it.val)
+		if err != nil {
+			switch err.(type) {
+			case numberRangeError:
+				p.panicErr(it, errParseRange{i: it.val, size: "int64"})
+			default:
+				p.panicItemf(it, "%s", err.Error())
+			}
+		}
+		return n, p.typeOfPrimitive(it)
+	}
+
 	num, err := strconv.ParseInt(it.val, 0, 64)
 	if err != nil {
 		// Distinguish integer values. Normally, it'd be a bug if the lexer
@@ -326,6 +341,20 @@ func (p *parser) valueFloat(it item) (any, tomlType) {
 		signbit = val == "-nan"
 		val = "nan"
 	}
+
+	if p.exactNums {
+		n, err := parseNumberLexeme(it.val)
+		if err != nil {
+			switch err.(type) {
+			case numberRangeError:
+				p.panicErr(it, errParseRange{i: it.val, size: "float64"})
+			default:
+				p.panicItemf(it, "%s", err.Error())
+			}
+		}
+		return n, p.typeOfPrimitive(it)
+	}
+
 	num, err := strconv.ParseFloat(val, 64)
 	if err != nil {
 		if e, ok := err.(*strconv.NumError); ok && e.Err == strconv.ErrRange {

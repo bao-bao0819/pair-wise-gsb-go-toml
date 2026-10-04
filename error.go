@@ -195,6 +195,7 @@ type (
 	errParseRange  struct {
 		i    any    // int or float
 		size string // "int64", "uint16", etc.
+		wrap error  // optional sentinel; nil keeps the default behavior
 	}
 	errUnsafeFloat struct {
 		i    any    // float32 or float64
@@ -225,6 +226,7 @@ func (e errLexStringNL) Error() string { return "strings cannot contain newlines
 func (e errLexStringNL) Usage() string { return usageStringNewline }
 func (e errParseRange) Error() string  { return fmt.Sprintf("%v is out of range for %s", e.i, e.size) }
 func (e errParseRange) Usage() string  { return usageIntOverflow }
+func (e errParseRange) Unwrap() error  { return e.wrap }
 func (e errUnsafeFloat) Error() string {
 	return fmt.Sprintf("%v is out of the safe %s range", e.i, e.size)
 }

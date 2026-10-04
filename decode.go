@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"math/big"
 	"os"
 	"reflect"
 	"strconv"
@@ -118,8 +119,9 @@ const (
 // This decoder does not handle cyclic types. Decode will not terminate if a
 // cyclic type is passed.
 type Decoder struct {
-	r        io.Reader
-	maxDepth int
+	r         io.Reader
+	maxDepth  int
+	exactNums bool
 }
 
 // NewDecoder creates a new Decoder.
@@ -133,10 +135,35 @@ func NewDecoder(r io.Reader) *Decoder {
 // The default is 128. Set to <=0 to disable the limit.
 func (dec *Decoder) MaxDepth(l int) { dec.maxDepth = l }
 
+// SetStrictNumbers enables or disables exact number handling.
+//
+// By default TOML integers decode as int64 and floats as float64, so values
+// such as 0.1, -0.0 or very large exponents lose information. With exact
+// numbers enabled, numbers decoded into an empty interface (or into a
+// [Number], [math/big.Int] or [math/big.Rat] value) are represented by a
+// [Number], which preserves the original TOML lexeme and the integer/float
+// distinction.
+//
+// Integers still obey the TOML int64 range; finite decimals convert exactly to
+// [math/big.Rat] on demand; inf, NaN and signed zero are represented
+// separately. Decoding into ordinary Go integer or float types keeps the
+// default loose behavior, while the conversion methods on [Number] report
+// overflow and rounding precisely.
+//
+// This only affects decoding done through this Decoder; the default behavior
+// of [Decode], [Unmarshal] and [DecodeFile] is unchanged.
+func (dec *Decoder) SetStrictNumbers(on bool) *Decoder {
+	dec.exactNums = on
+	return dec
+}
+
 var (
 	unmarshalToml = reflect.TypeOf((*Unmarshaler)(nil)).Elem()
 	unmarshalText = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
 	primitiveType = reflect.TypeOf((*Primitive)(nil)).Elem()
+	numberType    = reflect.TypeOf(Number{})
+	bigIntType    = reflect.TypeOf(big.Int{})
+	bigRatType    = reflect.TypeOf(big.Rat{})
 )
 
 // Decode TOML data in to the pointer `v`.
@@ -171,7 +198,7 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		return MetaData{}, err
 	}
 
-	p, err := parse(string(data), dec.maxDepth)
+	p, err := parse(string(data), dec.maxDepth, dec.exactNums)
 	if err != nil {
 		return MetaData{}, err
 	}
@@ -261,6 +288,18 @@ func (md *MetaData) unify(data any, rv reflect.Value) error {
 		}
 		return nil
 	}
+
+	// Exact-number targets: a TOML Number goes into Number/big.Int/big.Rat
+	// directly without going through float64.
+	if num, ok := data.(Number); ok {
+		if err := md.unifyNumber(num, rv, rvi); err != nil {
+			return err
+		}
+		if _, handled := exactNumberTarget(rv); handled {
+			return nil
+		}
+	}
+
 	if v, ok := rvi.(encoding.TextUnmarshaler); ok {
 		return md.unifyText(data, v)
 	}
@@ -302,6 +341,99 @@ func (md *MetaData) unify(data any, rv reflect.Value) error {
 	return md.e("unsupported type %s", rv.Kind())
 }
 
+// exactNumberTarget reports whether rv is one of the exact-number target
+// types (Number, big.Int, big.Rat, or a pointer to them).
+func exactNumberTarget(rv reflect.Value) (reflect.Type, bool) {
+	t := rv.Type()
+	if rv.Kind() == reflect.Pointer {
+		switch t.Elem() {
+		case numberType, bigIntType, bigRatType:
+			return t.Elem(), true
+		}
+	}
+	if t == numberType || t == bigIntType || t == bigRatType {
+		return t, true
+	}
+	return nil, false
+}
+
+// unifyNumber stores a Number decoded in exact mode into a Number, big.Int or
+// big.Rat target, supporting value, pointer and nil-pointer destinations.
+func (md *MetaData) unifyNumber(num Number, rv reflect.Value, rvi any) error {
+	elem, ok := exactNumberTarget(rv)
+	if !ok {
+		return nil
+	}
+
+	// Resolve the value to assign for each concrete element type.
+	var val reflect.Value
+	switch elem {
+	case numberType:
+		val = reflect.ValueOf(num)
+	case bigIntType:
+		if num.Kind() != NumberInteger {
+			return md.badtype("integer", num)
+		}
+		bv, err := num.BigInt()
+		if err != nil {
+			return md.parseErr(err)
+		}
+		val = reflect.ValueOf(*bv)
+	case bigRatType:
+		if num.IsInf() || num.IsNaN() {
+			return md.parseErr(num.numErr("Rat", ErrNumberNonFinite))
+		}
+		rvv, err := num.Rat()
+		if err != nil {
+			return md.parseErr(err)
+		}
+		val = reflect.ValueOf(*rvv)
+	}
+
+	if rv.Kind() == reflect.Pointer {
+		// Reachable for pointer fields: a nil pointer gets a freshly
+		// allocated pointee written back through the addressable field.
+		if rv.IsNil() {
+			if !rv.CanSet() {
+				return md.e("cannot set nil pointer %s", rv.Type())
+			}
+			p := reflect.New(elem)
+			p.Elem().Set(val)
+			rv.Set(p)
+			return nil
+		}
+		rv.Elem().Set(val)
+		return nil
+	}
+
+	// Value targets: settable copies (map elements) assign directly;
+	// addressable fields are reached as *T via rv.Interface().
+	if rv.CanSet() {
+		rv.Set(val)
+		return nil
+	}
+	switch elem {
+	case numberType:
+		if dst, ok := rvi.(*Number); ok {
+			*dst = num
+			return nil
+		}
+	case bigIntType:
+		if dst, ok := rvi.(*big.Int); ok {
+			bv, _ := num.BigInt()
+			dst.Set(bv)
+			return nil
+		}
+	case bigRatType:
+		if dst, ok := rvi.(*big.Rat); ok {
+			r, _ := num.Rat()
+			dst.Set(r)
+			return nil
+		}
+	}
+	return md.e("cannot set %s: value is not addressable", elem)
+}
+
 func (md *MetaData) unifyStruct(mapping any, rv reflect.Value) error {
 	tmap, ok := mapping.(map[string]any)
 	if !ok {
@@ -327,6 +459,18 @@ func (md *MetaData) unifyStruct(mapping any, rv reflect.Value) error {
 		if f != nil {
 			subv := rv
 			for _, i := range f.index {
+				// Keep exact-number targets addressable (or as a pointer):
+				// big.Int/big.Rat implement TextUnmarshaler, which makes
+				// indirect() take their address and return an unaddressable
+				// copy; nil pointers would lose the newly allocated value too.
+				ft := subv.Field(i).Type()
+				if ft == bigIntType || ft == bigRatType || ft == numberType ||
+					ft == reflect.PointerTo(bigIntType) ||
+					ft == reflect.PointerTo(bigRatType) ||
+					ft == reflect.PointerTo(numberType) {
+					subv = subv.Field(i)
+					continue
+				}
 				subv = indirect(subv.Field(i))
 			}
 
@@ -438,6 +582,8 @@ func (md *MetaData) unifyString(data any, rv reflect.Value) error {
 			rv.SetString(strconv.FormatInt(i, 10))
 		} else if f, ok := data.(float64); ok {
 			rv.SetString(strconv.FormatFloat(f, 'g', -1, 64))
+		} else if n, ok := data.(Number); ok {
+			rv.SetString(n.String())
 		} else {
 			return md.badtype("string", data)
 		}
@@ -453,6 +599,41 @@ func (md *MetaData) unifyString(data any, rv reflect.Value) error {
 
 func (md *MetaData) unifyFloat64(data any, rv reflect.Value) error {
 	rvk := rv.Kind()
+
+	if num, ok := data.(Number); ok {
+		if num.IsInf() || num.IsNaN() || num.intVal.Sign() == 0 {
+			f, _ := num.floatBits(64)
+			if rvk == reflect.Float32 && (f < -math.MaxFloat32 || f > math.MaxFloat32) {
+				return md.parseErr(errParseRange{i: num.Lexeme(), size: rvk.String()})
+			}
+			rv.SetFloat(f)
+			return nil
+		}
+
+		if num.Kind() == NumberInteger {
+			n, err := num.Int64()
+			if err != nil {
+				return md.parseErr(errUnsafeFloat{i: num.Lexeme(), size: rvk.String()})
+			}
+			if (rvk == reflect.Float32 && (n < -maxSafeFloat32Int || n > maxSafeFloat32Int)) ||
+				(rvk == reflect.Float64 && (n < -maxSafeFloat64Int || n > maxSafeFloat64Int)) {
+				return md.parseErr(errUnsafeFloat{i: n, size: rvk.String()})
+			}
+			rv.SetFloat(float64(n))
+			return nil
+		}
+
+		r, _ := num.Rat()
+		f, _ := r.Float64()
+		if math.IsInf(f, 0) {
+			return md.parseErr(errParseRange{i: num.Lexeme(), size: rvk.String()})
+		}
+		if rvk == reflect.Float32 && (f < -math.MaxFloat32 || f > math.MaxFloat32) {
+			return md.parseErr(errParseRange{i: num.Lexeme(), size: rvk.String()})
+		}
+		rv.SetFloat(f)
+		return nil
+	}
 
 	if num, ok := data.(float64); ok {
 		switch rvk {
@@ -496,8 +677,22 @@ func (md *MetaData) unifyInt(data any, rv reflect.Value) error {
 		}
 	}
 
-	num, ok := data.(int64)
-	if !ok {
+	var num int64
+	fromExact := false
+	switch d := data.(type) {
+	case int64:
+		num = d
+	case Number:
+		fromExact = true
+		if d.Kind() != NumberInteger {
+			return md.badtype("integer", d)
+		}
+		n, err := d.Int64()
+		if err != nil {
+			return md.parseErr(errParseRange{i: d.Lexeme(), size: "int64", wrap: ErrNumberOverflow})
+		}
+		num = n
+	default:
 		return md.badtype("integer", data)
 	}
 
@@ -505,13 +700,21 @@ func (md *MetaData) unifyInt(data any, rv reflect.Value) error {
 	switch {
 	case rvk >= reflect.Int && rvk <= reflect.Int64:
 		if rv.OverflowInt(num) {
-			return md.parseErr(errParseRange{i: num, size: rvk.String()})
+			rerr := errParseRange{i: num, size: rvk.String()}
+			if fromExact {
+				rerr.wrap = ErrNumberOverflow
+			}
+			return md.parseErr(rerr)
 		}
 		rv.SetInt(num)
 	case rvk >= reflect.Uint && rvk <= reflect.Uint64:
 		unum := uint64(num)
 		if num < 0 || rv.OverflowUint(unum) {
-			return md.parseErr(errParseRange{i: num, size: rvk.String()})
+			rerr := errParseRange{i: num, size: rvk.String()}
+			if fromExact {
+				rerr.wrap = ErrNumberOverflow
+			}
+			return md.parseErr(rerr)
 		}
 		rv.SetUint(unum)
 	default:
@@ -558,6 +761,8 @@ func (md *MetaData) unifyText(data any, v encoding.TextUnmarshaler) error {
 		s = fmt.Sprintf("%d", sdata)
 	case float64:
 		s = strconv.FormatFloat(sdata, 'g', -1, 64)
+	case Number:
+		s = sdata.String()
 	default:
 		return md.badtype("primitive (string-like)", data)
 	}

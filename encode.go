@@ -130,11 +130,24 @@ type Encoder struct {
 	Indent     string // string for a single indentation level; default is two spaces.
 	hasWritten bool   // written any output to w yet?
 	w          *bufio.Writer
+	canonNums  bool // render Number values canonically instead of verbatim
 }
 
 // NewEncoder create a new Encoder.
 func NewEncoder(w io.Writer) *Encoder {
 	return &Encoder{w: bufio.NewWriter(w), Indent: "  "}
+}
+
+// CanonicalNumbers makes [Number] values encode in the canonical form produced
+// by [Number.String] instead of in their original TOML lexeme.
+//
+// By default exact numbers round-trip verbatim: underscores, base prefixes and
+// exponents from the source are preserved. Canonical output always uses plain
+// signed decimal (integers) or decimal/exponent floats, without underscores.
+// Either form re-decodes to the same number kind and value.
+func (enc *Encoder) CanonicalNumbers() *Encoder {
+	enc.canonNums = true
+	return enc
 }
 
 // Encode writes a TOML representation of the Go value to the [Encoder]'s writer.
@@ -174,6 +187,9 @@ func (enc *Encoder) encode(key Key, rv reflect.Value) {
 		return
 	case rv.Type() == primitiveType: // TODO: #76 would make this superfluous after implemented.
 		enc.encode(key, reflect.ValueOf(rv.Interface().(Primitive).undecoded))
+		return
+	case rv.Type() == numberType:
+		enc.writeKeyValue(key, rv, false)
 		return
 	}
 
@@ -265,6 +281,13 @@ func (enc *Encoder) eElement(rv reflect.Value) {
 			return
 		}
 		encPanic(fmt.Errorf("unable to convert %q to int64 or float64", n))
+	case Number:
+		if enc.canonNums {
+			enc.write(v.String())
+		} else {
+			enc.write(v.Lexeme())
+		}
+		return
 	}
 
 	switch rv.Kind() {
@@ -564,6 +587,13 @@ func (enc *Encoder) eStruct(key Key, rv reflect.Value, inline bool) {
 func tomlTypeOfGo(rv reflect.Value) tomlType {
 	if isNil(rv) || !rv.IsValid() {
 		return nil
+	}
+
+	if rv.Type() == numberType {
+		if rv.Interface().(Number).Kind() == NumberInteger {
+			return tomlInteger
+		}
+		return tomlFloat
 	}
 
 	if rv.Kind() == reflect.Struct {
