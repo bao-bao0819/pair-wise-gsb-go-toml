@@ -119,16 +119,23 @@ func Marshal(v any) ([]byte, error) {
 // skipped.
 //
 // Encoding Go values without a corresponding TOML representation will return an
-// error. Examples of this includes maps with non-string keys, slices with nil
-// elements, embedded non-struct types, and nested slices containing maps or
-// structs. (e.g. [][]map[string]string is not allowed but []map[string]string
-// is okay, as is []map[string][]string).
+// error. Examples of this includes maps with non-string keys (unless a
+// [MapKeyCodec] is registered for the key type), slices with nil elements,
+// embedded non-struct types, and nested slices containing maps or structs.
+// (e.g. [][]map[string]string is not allowed but []map[string]string is okay,
+// as is []map[string][]string).
 //
 // NOTE: only exported keys are encoded due to the use of reflection. Unexported
 // keys are silently discarded.
 type Encoder struct {
-	Indent     string // string for a single indentation level; default is two spaces.
-	hasWritten bool   // written any output to w yet?
+	Indent string // string for a single indentation level; default is two spaces.
+
+	// MapKeyCodecs lists the codecs used to encode maps with a non-string
+	// key type, matched on the exact key type. Without a matching codec only
+	// maps with string keys can be encoded. See [MapKeyCodec].
+	MapKeyCodecs []MapKeyCodec
+
+	hasWritten bool // written any output to w yet?
 	w          *bufio.Writer
 }
 
@@ -142,6 +149,10 @@ func NewEncoder(w io.Writer) *Encoder {
 // An error is returned if the value given cannot be encoded to a valid TOML
 // document.
 func (enc *Encoder) Encode(v any) error {
+	if err := validateMapKeyCodecs(enc.MapKeyCodecs); err != nil {
+		return err
+	}
+
 	rv := eindirect(reflect.ValueOf(v))
 	err := enc.safeEncode(Key([]string{}), rv)
 	if err != nil {
@@ -396,36 +407,63 @@ func (enc *Encoder) eMapOrStruct(key Key, rv reflect.Value, inline bool) {
 
 func (enc *Encoder) eMap(key Key, rv reflect.Value, inline bool) {
 	rt := rv.Type()
-	if rt.Key().Kind() != reflect.String {
+
+	codec, err := findMapKeyCodec(enc.MapKeyCodecs, rt.Key())
+	if err != nil {
+		encPanic(err)
+	}
+	if codec == nil && rt.Key().Kind() != reflect.String {
 		encPanic(errNonString)
+	}
+
+	// Resolve every key to its TOML text before writing anything, so that
+	// encoding errors, collisions between keys, and non-reversible encodings
+	// are reported before any output for this map is produced.
+	type mapKeyT struct {
+		val  reflect.Value
+		text string
+	}
+	var seen map[string]reflect.Value
+	if codec != nil {
+		seen = make(map[string]reflect.Value, rv.Len())
+	}
+	allKeys := make([]mapKeyT, 0, rv.Len())
+	for _, k := range rv.MapKeys() {
+		var text string
+		if codec != nil {
+			text = encodeMapKey(codec, k, seen)
+		} else {
+			text = k.String()
+		}
+		allKeys = append(allKeys, mapKeyT{val: k, text: text})
 	}
 
 	// Sort keys so that we have deterministic output. And write keys directly
 	// underneath this key first, before writing sub-structs or sub-maps.
-	var mapKeysDirect, mapKeysSub []reflect.Value
-	for _, mapKey := range rv.MapKeys() {
-		if typeIsTable(tomlTypeOfGo(eindirect(rv.MapIndex(mapKey)))) {
+	var mapKeysDirect, mapKeysSub []mapKeyT
+	for _, mapKey := range allKeys {
+		if typeIsTable(tomlTypeOfGo(eindirect(rv.MapIndex(mapKey.val)))) {
 			mapKeysSub = append(mapKeysSub, mapKey)
 		} else {
 			mapKeysDirect = append(mapKeysDirect, mapKey)
 		}
 	}
 
-	writeMapKeys := func(mapKeys []reflect.Value, trailC bool) {
-		sort.Slice(mapKeys, func(i, j int) bool { return mapKeys[i].String() < mapKeys[j].String() })
+	writeMapKeys := func(mapKeys []mapKeyT, trailC bool) {
+		sort.Slice(mapKeys, func(i, j int) bool { return mapKeys[i].text < mapKeys[j].text })
 		for i, mapKey := range mapKeys {
-			val := eindirect(rv.MapIndex(mapKey))
+			val := eindirect(rv.MapIndex(mapKey.val))
 			if isNil(val) {
 				continue
 			}
 
 			if inline {
-				enc.writeKeyValue(Key{mapKey.String()}, val, true)
+				enc.writeKeyValue(Key{mapKey.text}, val, true)
 				if trailC || i != len(mapKeys)-1 {
 					enc.write(", ")
 				}
 			} else {
-				enc.encode(key.add(mapKey.String()), val)
+				enc.encode(key.add(mapKey.text), val)
 			}
 		}
 	}
@@ -438,6 +476,39 @@ func (enc *Encoder) eMap(key Key, rv reflect.Value, inline bool) {
 	if inline {
 		enc.write("}")
 	}
+}
+
+// encodeMapKey converts a single non-string map key to its TOML key text with
+// the codec, checking for collisions with previously encoded keys of the same
+// map and verifying the encoding is reversible.
+func encodeMapKey(codec *MapKeyCodec, k reflect.Value, seen map[string]reflect.Value) string {
+	if (k.Kind() == reflect.Pointer || k.Kind() == reflect.Interface) && k.IsNil() {
+		encPanic(fmt.Errorf("toml: cannot encode nil map key of type %s", k.Type()))
+	}
+
+	text, err := codec.Encode(k.Interface())
+	if err != nil {
+		encPanic(fmt.Errorf("toml: cannot encode map key %v of type %s: %w", k, k.Type(), err))
+	}
+
+	if prev, ok := seen[text]; ok {
+		encPanic(fmt.Errorf("toml: map keys %v and %v of type %s both encode to TOML key %q",
+			prev, k, k.Type(), text))
+	}
+	seen[text] = k
+
+	// Don't trust the encoded text alone: the key must survive a round trip
+	// through Decode, or decoding the document would produce a different map.
+	back, err := codec.Decode(text)
+	if err != nil {
+		encPanic(fmt.Errorf("toml: map key %v of type %s encodes to TOML key %q, but decoding it back failed: %s; the map key encoding must be reversible",
+			k, k.Type(), text, err))
+	}
+	if !reflect.DeepEqual(back, k.Interface()) {
+		encPanic(fmt.Errorf("toml: map key %v of type %s encodes to TOML key %q, but that decodes back to %v; the map key encoding must be reversible",
+			k, k.Type(), text, back))
+	}
+	return text
 }
 
 func pointerTo(t reflect.Type) reflect.Type {

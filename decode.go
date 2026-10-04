@@ -109,6 +109,9 @@ const (
 // that don't match the key name exactly (see the example). A case insensitive
 // match to struct names will be tried if an exact match can't be found.
 //
+// Maps with a non-string key type (such as an enum) can be decoded to by
+// registering a [MapKeyCodec] for the key type.
+//
 // The mapping between TOML values and Go values is loose. That is, there may
 // exist TOML values that cannot be placed into your representation, and there
 // may be parts of your representation that do not correspond to TOML values.
@@ -118,6 +121,11 @@ const (
 // This decoder does not handle cyclic types. Decode will not terminate if a
 // cyclic type is passed.
 type Decoder struct {
+	// MapKeyCodecs lists the codecs used to decode into maps with a
+	// non-string key type, matched on the exact key type. Without a matching
+	// codec only maps with string keys can be decoded to. See [MapKeyCodec].
+	MapKeyCodecs []MapKeyCodec
+
 	r        io.Reader
 	maxDepth int
 }
@@ -141,6 +149,10 @@ var (
 
 // Decode TOML data in to the pointer `v`.
 func (dec *Decoder) Decode(v any) (MetaData, error) {
+	if err := validateMapKeyCodecs(dec.MapKeyCodecs); err != nil {
+		return MetaData{}, err
+	}
+
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer {
 		s := "%q"
@@ -177,12 +189,13 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 	}
 
 	md := MetaData{
-		mapping: p.mapping,
-		keyInfo: p.keyInfo,
-		keys:    p.ordered,
-		decoded: make(map[string]struct{}, len(p.ordered)),
-		context: nil,
-		data:    data,
+		mapping:      p.mapping,
+		keyInfo:      p.keyInfo,
+		keys:         p.ordered,
+		decoded:      make(map[string]struct{}, len(p.ordered)),
+		context:      nil,
+		data:         data,
+		mapKeyCodecs: dec.MapKeyCodecs,
 	}
 	return md, md.unify(p.mapping, rv)
 }
@@ -348,10 +361,16 @@ func (md *MetaData) unifyStruct(mapping any, rv reflect.Value) error {
 }
 
 func (md *MetaData) unifyMap(mapping any, rv reflect.Value) error {
-	keyType := rv.Type().Key().Kind()
-	if keyType != reflect.String && keyType != reflect.Interface {
+	keyType := rv.Type().Key()
+	keyKind := keyType.Kind()
+
+	codec, err := findMapKeyCodec(md.mapKeyCodecs, keyType)
+	if err != nil {
+		return err
+	}
+	if codec == nil && keyKind != reflect.String && keyKind != reflect.Interface {
 		return fmt.Errorf("toml: cannot decode to a map with non-string key type (%s in %q)",
-			keyType, rv.Type())
+			keyKind, rv.Type())
 	}
 
 	tmap, ok := mapping.(map[string]any)
@@ -361,9 +380,18 @@ func (md *MetaData) unifyMap(mapping any, rv reflect.Value) error {
 		}
 		return md.badtype("map", mapping)
 	}
-	if rv.IsNil() {
+
+	// With a key codec, decode into a temporary map and only update the
+	// target once every key and value has been converted successfully, so a
+	// failure leaves the target map untouched.
+	target := rv
+	if codec != nil {
+		target = reflect.MakeMap(rv.Type())
+	} else if rv.IsNil() {
 		rv.Set(reflect.MakeMap(rv.Type()))
 	}
+
+	seen := make(map[any]string, len(tmap)) // Go key → TOML key; codec only.
 	for k, v := range tmap {
 		md.decoded[md.context.add(k).String()] = struct{}{}
 		md.context = append(md.context, k)
@@ -376,16 +404,49 @@ func (md *MetaData) unifyMap(mapping any, rv reflect.Value) error {
 		}
 		md.context = md.context[0 : len(md.context)-1]
 
-		rvkey := indirect(reflect.New(rv.Type().Key()))
+		if codec != nil {
+			gk, err := codec.Decode(k)
+			if err != nil {
+				return md.e("cannot decode TOML key %q to map key type %s: %s", k, keyType, err)
+			}
+			rvkey := reflect.ValueOf(gk)
+			if !rvkey.IsValid() {
+				return md.e("map key codec for %s decoded TOML key %q to nil", keyType, k)
+			}
+			if !rvkey.Type().AssignableTo(keyType) {
+				return md.e("map key codec decoded TOML key %q to %s, which is not assignable to map key type %s",
+					k, rvkey.Type(), keyType)
+			}
+			if prev, dup := seen[gk]; dup {
+				return md.e("TOML keys %q and %q both decode to the same map key %v", prev, k, gk)
+			}
+			seen[gk] = k
 
-		switch keyType {
+			target.SetMapIndex(rvkey, rvval)
+			continue
+		}
+
+		rvkey := indirect(reflect.New(keyType))
+
+		switch keyKind {
 		case reflect.Interface:
 			rvkey.Set(reflect.ValueOf(k))
 		case reflect.String:
 			rvkey.SetString(k)
 		}
 
-		rv.SetMapIndex(rvkey, rvval)
+		target.SetMapIndex(rvkey, rvval)
+	}
+
+	if codec != nil {
+		if rv.IsNil() {
+			rv.Set(target)
+		} else {
+			iter := target.MapRange()
+			for iter.Next() {
+				rv.SetMapIndex(iter.Key(), iter.Value())
+			}
+		}
 	}
 	return nil
 }
