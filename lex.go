@@ -67,6 +67,17 @@ type lexer struct {
 	// arrays. The last state on the stack is used after a value has been lexed.
 	// Similarly for comments.
 	stack []stateFn
+
+	// TOML version the document is parsed as, and the list of versioned
+	// features encountered so far (shared with the parser).
+	version  Version
+	features *[]Feature
+
+	// Track a comma in an inline table, to detect trailing commas when a
+	// newline or comment follows (e.g. "{a = 1, \n}").
+	inlineComma     bool
+	inlineCommaPos  int
+	inlineCommaLine int
 }
 
 type item struct {
@@ -88,15 +99,33 @@ func (lx *lexer) nextItem() item {
 	}
 }
 
-func lex(input string) *lexer {
+func lex(input string, version Version, features *[]Feature) *lexer {
 	lx := &lexer{
-		input: input,
-		state: lexTop,
-		items: make(chan item, 10),
-		stack: make([]stateFn, 0, 10),
-		line:  1,
+		input:    input,
+		state:    lexTop,
+		items:    make(chan item, 10),
+		stack:    make([]stateFn, 0, 10),
+		line:     1,
+		version:  version,
+		features: features,
 	}
 	return lx
+}
+
+// feature records a TOML construct requiring a version newer than TOML 1.0 at
+// [start, start+length).
+//
+// It reports whether the construct is supported by the version the document
+// is parsed as; if not, a version error is emitted and the caller should stop
+// lexing by returning nil.
+func (lx *lexer) feature(f Feature, start, length, line int) bool {
+	f.Position = Position{Line: line, Start: start, Len: length}
+	*lx.features = append(*lx.features, f)
+	if lx.version >= f.Since {
+		return true
+	}
+	lx.items <- item{typ: itemError, pos: f.Position, err: errVersion{feature: f, version: lx.version}}
+	return false
 }
 
 func (lx *lexer) push(state stateFn) {
@@ -624,16 +653,29 @@ func lexInlineTableValue(lx *lexer) stateFn {
 	case isWhitespace(r):
 		return lexSkip(lx, lexInlineTableValue)
 	case isNL(r):
+		if r == '\n' && !lx.feature(featInlineTableNewline, lx.pos-1, 1, lx.line-1) {
+			return nil
+		}
 		return lexSkip(lx, lexInlineTableValue)
 	case r == '#':
+		if !lx.feature(featInlineTableComment, lx.pos-1, 1, lx.line) {
+			return nil
+		}
 		lx.push(lexInlineTableValue)
 		return lexCommentStart
 	case r == ',':
 		return lx.errorf("unexpected comma")
 	case r == '}':
+		if lx.inlineComma {
+			lx.inlineComma = false
+			if !lx.feature(featInlineTableTrailingComma, lx.inlineCommaPos, 1, lx.inlineCommaLine) {
+				return nil
+			}
+		}
 		return lexInlineTableEnd
 	}
 	lx.backup()
+	lx.inlineComma = false
 	lx.push(lexInlineTableValueEnd)
 	return lexKeyStart
 }
@@ -646,16 +688,29 @@ func lexInlineTableValueEnd(lx *lexer) stateFn {
 	case isWhitespace(r):
 		return lexSkip(lx, lexInlineTableValueEnd)
 	case isNL(r):
+		if r == '\n' && !lx.feature(featInlineTableNewline, lx.pos-1, 1, lx.line-1) {
+			return nil
+		}
 		return lexSkip(lx, lexInlineTableValueEnd)
 	case r == '#':
+		if !lx.feature(featInlineTableComment, lx.pos-1, 1, lx.line) {
+			return nil
+		}
 		lx.push(lexInlineTableValueEnd)
 		return lexCommentStart
 	case r == ',':
+		commaPos, commaLine := lx.pos-1, lx.line
 		lx.ignore()
 		lx.skip(isWhitespace)
 		if lx.peek() == '}' {
+			if !lx.feature(featInlineTableTrailingComma, commaPos, 1, commaLine) {
+				return nil
+			}
 			return lexInlineTableValueEnd
 		}
+		lx.inlineComma = true
+		lx.inlineCommaPos = commaPos
+		lx.inlineCommaLine = commaLine
 		return lexInlineTableValue
 	case r == '}':
 		return lexInlineTableEnd
@@ -842,7 +897,10 @@ func lexStringEscape(lx *lexer) stateFn {
 	r := lx.next()
 	switch r {
 	case 'e':
-		fallthrough
+		if !lx.feature(featEscapeE, lx.pos-2, 2, lx.line) {
+			return nil
+		}
+		return lx.pop()
 	case 'b':
 		fallthrough
 	case 't':
@@ -862,6 +920,9 @@ func lexStringEscape(lx *lexer) stateFn {
 	case '\\':
 		return lx.pop()
 	case 'x':
+		if !lx.feature(featEscapeX, lx.pos-2, 4, lx.line) {
+			return nil
+		}
 		return lexHexEscape
 	case 'u':
 		return lexShortUnicodeEscape

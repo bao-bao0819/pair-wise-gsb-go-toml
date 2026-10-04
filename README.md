@@ -5,6 +5,33 @@ Compatible with TOML version [v1.1.0](https://toml.io/en/v1.1.0).
 
 Documentation: https://pkg.go.dev/github.com/BurntSushi/toml
 
+### TOML 1.0 and 1.1
+Documents are parsed as TOML 1.1 by default. Use `Decoder.Version` to parse a
+document as TOML 1.0, and `toml.CheckVersion` to list every construct in a
+document that requires a version newer than TOML 1.0:
+
+```go
+dec := toml.NewDecoder(r)
+dec.Version(toml.Version10) // Error on TOML 1.1 constructs.
+
+minVersion, features, err := toml.CheckVersion(tomlData)
+```
+
+Differences between TOML 1.0 and 1.1, per the official specification
+([v1.0.0](https://toml.io/en/v1.0.0), [v1.1.0](https://toml.io/en/v1.1.0)):
+
+| Feature                            | TOML 1.0  | TOML 1.1                |
+|------------------------------------|-----------|-------------------------|
+| `\e` escape (ESC, U+001B)          | Invalid   | Valid in basic strings  |
+| `\xHH` hex byte escape             | Invalid   | Valid in basic strings  |
+| Newlines in inline tables          | Invalid   | Valid                   |
+| Comments in inline tables          | Invalid   | Valid                   |
+| Trailing comma in inline tables    | Invalid   | Valid                   |
+| Seconds in times (`07:32:00`)      | Required  | Optional (`07:32`)      |
+
+Newlines inside values nested in an inline table (arrays, multi-line strings)
+were always allowed, in both versions.
+
 See the [releases page](https://github.com/BurntSushi/toml/releases) for a
 changelog; this information is also in the git tag annotations (e.g. `git show
 v0.4.0`).

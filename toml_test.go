@@ -298,15 +298,6 @@ func TestToml(t *testing.T) {
 		}
 	}
 
-	fixedInGo123 := ""
-	_, minor, ok := strings.Cut(runtime.Version(), ".")
-	if ok {
-		minor, _, _ = strings.Cut(minor, ".")
-		if minor < "23" {
-			fixedInGo123 = "invalid/datetime/offset-overflow-hour"
-		}
-	}
-
 	r := tomltest.Runner{
 		Version:       "1.1.0",
 		Files:         tomltest.TestCases(),
@@ -314,37 +305,7 @@ func TestToml(t *testing.T) {
 		Decoder:       testDecoder{},
 		Encoder:       testEncoder{},
 		RunTests:      runTests,
-		SkipTests: []string{
-			fixedInGo123,
-
-			// Go accepts e.g. 12:60, which becomes 13:00, but rejects :61.
-			// TODO: might be bug in Go? It was changed before but I'm not sure
-			// if accepting :60 was intentional.
-			// Ref: https://github.com/BurntSushi/toml/issues/407
-			"invalid/datetime/offset-overflow-minute",
-
-			// TODO: fix this; we allow appending to tables, but shouldn't.
-			"invalid/array/extend-defined-aot",
-			"invalid/inline-table/duplicate-key-03",
-			"invalid/inline-table/overwrite-02",
-			"invalid/inline-table/overwrite-08",
-			"invalid/spec-1.0.0/inline-table-2-0",
-			"invalid/spec-1.0.0/table-9-1",
-			"invalid/spec-1.1.0/common-46-1",
-			"invalid/spec-1.1.0/common-49-0",
-			"invalid/table/append-to-array-with-dotted-keys",
-			"invalid/table/append-with-dotted-keys-01",
-			"invalid/table/append-with-dotted-keys-02",
-			"invalid/table/append-with-dotted-keys-03",
-			"invalid/table/append-with-dotted-keys-05",
-			"invalid/table/append-with-dotted-keys-08",
-			"invalid/table/duplicate-key-04",
-			"invalid/table/duplicate-key-05",
-			"invalid/table/duplicate-key-dotted-table-01",
-			"invalid/table/duplicate-key-dotted-table-02",
-			"invalid/table/redefine-02",
-			"invalid/table/redefine-03",
-		},
+		SkipTests:     tomlTestSkips(),
 	}
 
 	tests, err := r.Run()
@@ -390,6 +351,48 @@ func TestToml(t *testing.T) {
 		}
 		t.Errorf("the following meta tests didn't match any files: %s", strings.Join(s, ", "))
 	}
+}
+
+// Tests skipped for all TOML versions.
+func tomlTestSkips() []string {
+	skips := []string{
+		// Go accepts e.g. 12:60, which becomes 13:00, but rejects :61.
+		// TODO: might be bug in Go? It was changed before but I'm not sure
+		// if accepting :60 was intentional.
+		// Ref: https://github.com/BurntSushi/toml/issues/407
+		"invalid/datetime/offset-overflow-minute",
+
+		// TODO: fix this; we allow appending to tables, but shouldn't.
+		"invalid/array/extend-defined-aot",
+		"invalid/inline-table/duplicate-key-03",
+		"invalid/inline-table/overwrite-02",
+		"invalid/inline-table/overwrite-08",
+		"invalid/spec-1.0.0/inline-table-2-0",
+		"invalid/spec-1.0.0/table-9-1",
+		"invalid/spec-1.1.0/common-46-1",
+		"invalid/spec-1.1.0/common-49-0",
+		"invalid/table/append-to-array-with-dotted-keys",
+		"invalid/table/append-with-dotted-keys-01",
+		"invalid/table/append-with-dotted-keys-02",
+		"invalid/table/append-with-dotted-keys-03",
+		"invalid/table/append-with-dotted-keys-05",
+		"invalid/table/append-with-dotted-keys-08",
+		"invalid/table/duplicate-key-04",
+		"invalid/table/duplicate-key-05",
+		"invalid/table/duplicate-key-dotted-table-01",
+		"invalid/table/duplicate-key-dotted-table-02",
+		"invalid/table/redefine-02",
+		"invalid/table/redefine-03",
+	}
+
+	_, minor, ok := strings.Cut(runtime.Version(), ".")
+	if ok {
+		minor, _, _ = strings.Cut(minor, ".")
+		if minor < "23" {
+			skips = append(skips, "invalid/datetime/offset-overflow-hour")
+		}
+	}
+	return skips
 }
 
 var reCollapseSpace = regexp.MustCompile(` +`)

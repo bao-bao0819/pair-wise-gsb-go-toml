@@ -120,11 +120,12 @@ const (
 type Decoder struct {
 	r        io.Reader
 	maxDepth int
+	version  Version
 }
 
 // NewDecoder creates a new Decoder.
 func NewDecoder(r io.Reader) *Decoder {
-	return &Decoder{r: r, maxDepth: 128}
+	return &Decoder{r: r, maxDepth: 128, version: LatestVersion}
 }
 
 // MaxDepth sets the maximum table and array depth to prevent using an
@@ -132,6 +133,13 @@ func NewDecoder(r io.Reader) *Decoder {
 //
 // The default is 128. Set to <=0 to disable the limit.
 func (dec *Decoder) MaxDepth(l int) { dec.maxDepth = l }
+
+// Version sets the version of the TOML specification to parse documents as.
+// Documents using constructs introduced in a newer version fail with an error
+// explaining the construct and the version it requires.
+//
+// The default is [LatestVersion].
+func (dec *Decoder) Version(v Version) { dec.version = v }
 
 var (
 	unmarshalToml = reflect.TypeOf((*Unmarshaler)(nil)).Elem()
@@ -171,7 +179,7 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		return MetaData{}, err
 	}
 
-	p, err := parse(string(data), dec.maxDepth)
+	p, err := parse(string(data), dec.maxDepth, dec.version)
 	if err != nil {
 		return MetaData{}, err
 	}

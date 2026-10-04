@@ -14,11 +14,13 @@ import (
 type parser struct {
 	lx         *lexer
 	maxDepth   int
+	version    Version
 	arrDepth   int
 	context    Key      // Full key for the current hash in scope.
 	currentKey string   // Base key name for everything except hashes.
 	pos        Position // Current position in the TOML file.
 
+	features  []Feature           // TOML 1.1 constructs encountered so far.
 	ordered   []Key               // List of keys in the order that they appear in the TOML data.
 	keyInfo   map[string]keyInfo  // Map keyname → info about the TOML key.
 	mapping   map[string]any      // Map keyname → key value.
@@ -30,7 +32,7 @@ type keyInfo struct {
 	tomlType tomlType
 }
 
-func parse(data string, maxDepth int) (p *parser, err error) {
+func parse(data string, maxDepth int, version Version) (p *parser, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if pErr, ok := r.(ParseError); ok {
@@ -42,14 +44,7 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 		}
 	}()
 
-	// Read over BOM; do this here as the lexer calls utf8.DecodeRuneInString()
-	// which mangles stuff. UTF-16 BOM isn't strictly valid, but some tools add
-	// it anyway.
-	if strings.HasPrefix(data, "\xff\xfe") || strings.HasPrefix(data, "\xfe\xff") { // UTF-16
-		data = data[2:]
-	} else if strings.HasPrefix(data, "\xef\xbb\xbf") { // UTF-8
-		data = data[3:]
-	}
+	data = stripBOM(data)
 
 	// Examine first few bytes for NULL bytes; this probably means it's a UTF-16
 	// file (second byte in surrogate pair being NULL). Again, do this here to
@@ -63,14 +58,19 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 		}
 	}
 
+	if version == 0 {
+		version = LatestVersion
+	}
+
 	p = &parser{
-		lx:        lex(data),
 		maxDepth:  maxDepth,
+		version:   version,
 		keyInfo:   make(map[string]keyInfo),
 		mapping:   make(map[string]any),
 		ordered:   make([]Key, 0),
 		implicits: make(map[string]struct{}),
 	}
+	p.lx = lex(data, version, &p.features)
 	for {
 		item := p.next()
 		if item.typ == itemEOF {
@@ -80,6 +80,30 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 	}
 
 	return p, nil
+}
+
+// stripBOM removes a UTF-8 or UTF-16 byte order mark; do this here as the
+// lexer calls utf8.DecodeRuneInString() which mangles stuff. UTF-16 BOM isn't
+// strictly valid, but some tools add it anyway.
+func stripBOM(data string) string {
+	if strings.HasPrefix(data, "\xff\xfe") || strings.HasPrefix(data, "\xfe\xff") { // UTF-16
+		return data[2:]
+	}
+	if strings.HasPrefix(data, "\xef\xbb\xbf") { // UTF-8
+		return data[3:]
+	}
+	return data
+}
+
+// feature records a TOML construct requiring a version newer than TOML 1.0 at
+// the item's position, panicking with a version error if the version the
+// document is parsed as doesn't support it.
+func (p *parser) feature(f Feature, it item) {
+	f.Position = it.pos
+	p.features = append(p.features, f)
+	if p.version < f.Since {
+		p.panicErr(it, errVersion{feature: f, version: p.version})
+	}
 }
 
 func (p *parser) panicErr(it item, err error) {
@@ -341,16 +365,17 @@ func (p *parser) valueFloat(it item) (any, tomlType) {
 }
 
 var dtTypes = []struct {
-	fmt  string
-	zone *time.Location
+	fmt   string
+	zone  *time.Location
+	since Version
 }{
-	{time.RFC3339Nano, time.Local},
-	{"2006-01-02T15:04:05.999999999", internal.LocalDatetime},
-	{"2006-01-02", internal.LocalDate},
-	{"15:04:05.999999999", internal.LocalTime},
-	{"2006-01-02T15:04Z07:00", time.Local},
-	{"2006-01-02T15:04", internal.LocalDatetime},
-	{"15:04", internal.LocalTime},
+	{time.RFC3339Nano, time.Local, Version10},
+	{"2006-01-02T15:04:05.999999999", internal.LocalDatetime, Version10},
+	{"2006-01-02", internal.LocalDate, Version10},
+	{"15:04:05.999999999", internal.LocalTime, Version10},
+	{"2006-01-02T15:04Z07:00", time.Local, Version11},
+	{"2006-01-02T15:04", internal.LocalDatetime, Version11},
+	{"15:04", internal.LocalTime, Version11},
 }
 
 func (p *parser) valueDatetime(it item) (any, tomlType) {
@@ -365,6 +390,9 @@ func (p *parser) valueDatetime(it item) (any, tomlType) {
 		if err == nil {
 			if missingLeadingZero(it.val, dt.fmt) {
 				p.panicErr(it, errParseDate{it.val})
+			}
+			if dt.since > Version10 {
+				p.feature(featTimeOptionalSeconds, it)
 			}
 			ok = true
 			break

@@ -201,6 +201,10 @@ type (
 		size string // "float32" or "float64"
 	}
 	errParseDuration struct{ d string }
+	errVersion       struct {
+		feature Feature
+		version Version // Version the document is parsed as.
+	}
 )
 
 func (e errLexControl) Error() string {
@@ -231,6 +235,23 @@ func (e errUnsafeFloat) Error() string {
 func (e errUnsafeFloat) Usage() string   { return usageUnsafeFloat }
 func (e errParseDuration) Error() string { return fmt.Sprintf("invalid duration: %q", e.d) }
 func (e errParseDuration) Usage() string { return usageDuration }
+
+func (e errVersion) Error() string {
+	return fmt.Sprintf("%s requires TOML %s, but this document is being parsed as TOML %s",
+		e.feature.Description, e.feature.Since, e.version)
+}
+func (e errVersion) Usage() string { return usageVersion }
+
+const usageVersion = `
+This document uses a construct introduced in a newer version of TOML than the
+version it is being parsed as.
+
+Either parse the document as a newer TOML version (the default is the latest
+supported version), or rewrite the document to avoid this construct.
+
+toml.CheckVersion() lists every construct in a document that requires a newer
+TOML version.
+`
 
 const usageEscape = `
 A '\' inside a "-delimited string is interpreted as an escape character.
