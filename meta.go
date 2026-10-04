@@ -1,6 +1,7 @@
 package toml
 
 import (
+	"reflect"
 	"strings"
 )
 
@@ -12,11 +13,12 @@ import (
 type MetaData struct {
 	context Key // Used only during decoding.
 
-	keyInfo map[string]keyInfo
-	mapping map[string]any
-	keys    []Key
-	decoded map[string]struct{}
-	data    []byte // Input file; for errors.
+	keyInfo      map[string]keyInfo
+	mapping      map[string]any
+	keys         []Key
+	decoded      map[string]struct{}
+	data         []byte // Input file; for errors.
+	mapKeyCodecs map[reflect.Type]MapKeyCodec
 }
 
 // IsDefined reports if the key exists in the TOML data.

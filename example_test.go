@@ -5,10 +5,80 @@ import (
 	"fmt"
 	"log"
 	"net/mail"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
 )
+
+// Region is an enum used as a map key in ExampleMapKeyCodec.
+type Region int
+
+const (
+	RegionUSEast Region = iota
+	RegionEUWest
+)
+
+var regionNames = map[Region]string{
+	RegionUSEast: "us-east-1",
+	RegionEUWest: "eu-west-1",
+}
+
+// Maps with non-string key types such as enums can be encoded and decoded by
+// registering a MapKeyCodec for the key type.
+func ExampleMapKeyCodec() {
+	codec := toml.MapKeyCodec{
+		Marshal: func(k any) (string, error) {
+			name, ok := regionNames[k.(Region)]
+			if !ok {
+				return "", fmt.Errorf("unknown region %v", k)
+			}
+			return name, nil
+		},
+		Unmarshal: func(s string) (any, error) {
+			for r, name := range regionNames {
+				if name == s {
+					return r, nil
+				}
+			}
+			return nil, fmt.Errorf("unknown region %q", s)
+		},
+	}
+	regionType := reflect.TypeOf(Region(0))
+
+	type Config struct {
+		Endpoints map[Region]string
+	}
+
+	buf := new(bytes.Buffer)
+	enc := toml.NewEncoder(buf)
+	enc.RegisterMapKey(regionType, codec)
+	err := enc.Encode(Config{Endpoints: map[Region]string{
+		RegionUSEast: "https://us-east-1.example.com",
+		RegionEUWest: "https://eu-west-1.example.com",
+	}})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Print(buf.String())
+
+	var cfg Config
+	dec := toml.NewDecoder(strings.NewReader(buf.String()))
+	dec.RegisterMapKey(regionType, codec)
+	if _, err := dec.Decode(&cfg); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(cfg.Endpoints[RegionUSEast])
+	fmt.Println(cfg.Endpoints[RegionEUWest])
+
+	// Output:
+	// [Endpoints]
+	//   eu-west-1 = "https://eu-west-1.example.com"
+	//   us-east-1 = "https://us-east-1.example.com"
+	// https://us-east-1.example.com
+	// https://eu-west-1.example.com
+}
 
 func ExampleEncoder_Encode() {
 	var (

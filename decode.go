@@ -109,6 +109,9 @@ const (
 // that don't match the key name exactly (see the example). A case insensitive
 // match to struct names will be tried if an exact match can't be found.
 //
+// Maps with non-string key types (such as enums) can be decoded by
+// registering a [MapKeyCodec] for the key type with [Decoder.RegisterMapKey].
+//
 // The mapping between TOML values and Go values is loose. That is, there may
 // exist TOML values that cannot be placed into your representation, and there
 // may be parts of your representation that do not correspond to TOML values.
@@ -118,8 +121,9 @@ const (
 // This decoder does not handle cyclic types. Decode will not terminate if a
 // cyclic type is passed.
 type Decoder struct {
-	r        io.Reader
-	maxDepth int
+	r            io.Reader
+	maxDepth     int
+	mapKeyCodecs map[reflect.Type]MapKeyCodec
 }
 
 // NewDecoder creates a new Decoder.
@@ -177,12 +181,13 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 	}
 
 	md := MetaData{
-		mapping: p.mapping,
-		keyInfo: p.keyInfo,
-		keys:    p.ordered,
-		decoded: make(map[string]struct{}, len(p.ordered)),
-		context: nil,
-		data:    data,
+		mapping:      p.mapping,
+		keyInfo:      p.keyInfo,
+		keys:         p.ordered,
+		decoded:      make(map[string]struct{}, len(p.ordered)),
+		context:      nil,
+		data:         data,
+		mapKeyCodecs: dec.mapKeyCodecs,
 	}
 	return md, md.unify(p.mapping, rv)
 }
@@ -348,8 +353,9 @@ func (md *MetaData) unifyStruct(mapping any, rv reflect.Value) error {
 }
 
 func (md *MetaData) unifyMap(mapping any, rv reflect.Value) error {
+	codec, hasCodec := md.mapKeyCodecs[rv.Type().Key()]
 	keyType := rv.Type().Key().Kind()
-	if keyType != reflect.String && keyType != reflect.Interface {
+	if !hasCodec && keyType != reflect.String && keyType != reflect.Interface {
 		return fmt.Errorf("toml: cannot decode to a map with non-string key type (%s in %q)",
 			keyType, rv.Type())
 	}
@@ -360,6 +366,9 @@ func (md *MetaData) unifyMap(mapping any, rv reflect.Value) error {
 			return nil
 		}
 		return md.badtype("map", mapping)
+	}
+	if hasCodec {
+		return md.unifyMapKey(tmap, rv, codec)
 	}
 	if rv.IsNil() {
 		rv.Set(reflect.MakeMap(rv.Type()))

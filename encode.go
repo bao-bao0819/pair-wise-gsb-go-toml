@@ -10,7 +10,6 @@ import (
 	"io"
 	"math"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -118,18 +117,22 @@ func Marshal(v any) ([]byte, error) {
 // If omitzero is given all int and float types with a value of 0 will be
 // skipped.
 //
+// Maps with non-string key types (such as enums) can be encoded by
+// registering a [MapKeyCodec] for the key type with [Encoder.RegisterMapKey].
+//
 // Encoding Go values without a corresponding TOML representation will return an
-// error. Examples of this includes maps with non-string keys, slices with nil
-// elements, embedded non-struct types, and nested slices containing maps or
-// structs. (e.g. [][]map[string]string is not allowed but []map[string]string
-// is okay, as is []map[string][]string).
+// error. Examples of this includes maps with non-string keys and no registered
+// [MapKeyCodec], slices with nil elements, embedded non-struct types, and
+// nested slices containing maps or structs. (e.g. [][]map[string]string is not
+// allowed but []map[string]string is okay, as is []map[string][]string).
 //
 // NOTE: only exported keys are encoded due to the use of reflection. Unexported
 // keys are silently discarded.
 type Encoder struct {
-	Indent     string // string for a single indentation level; default is two spaces.
-	hasWritten bool   // written any output to w yet?
-	w          *bufio.Writer
+	Indent       string // string for a single indentation level; default is two spaces.
+	hasWritten   bool   // written any output to w yet?
+	w            *bufio.Writer
+	mapKeyCodecs map[reflect.Type]MapKeyCodec
 }
 
 // NewEncoder create a new Encoder.
@@ -395,37 +398,33 @@ func (enc *Encoder) eMapOrStruct(key Key, rv reflect.Value, inline bool) {
 }
 
 func (enc *Encoder) eMap(key Key, rv reflect.Value, inline bool) {
-	rt := rv.Type()
-	if rt.Key().Kind() != reflect.String {
-		encPanic(errNonString)
-	}
+	mapKeys := enc.mapKeys(rv)
 
 	// Sort keys so that we have deterministic output. And write keys directly
 	// underneath this key first, before writing sub-structs or sub-maps.
-	var mapKeysDirect, mapKeysSub []reflect.Value
-	for _, mapKey := range rv.MapKeys() {
-		if typeIsTable(tomlTypeOfGo(eindirect(rv.MapIndex(mapKey)))) {
+	var mapKeysDirect, mapKeysSub []mapKey
+	for _, mapKey := range mapKeys {
+		if typeIsTable(tomlTypeOfGo(eindirect(rv.MapIndex(mapKey.goKey)))) {
 			mapKeysSub = append(mapKeysSub, mapKey)
 		} else {
 			mapKeysDirect = append(mapKeysDirect, mapKey)
 		}
 	}
 
-	writeMapKeys := func(mapKeys []reflect.Value, trailC bool) {
-		sort.Slice(mapKeys, func(i, j int) bool { return mapKeys[i].String() < mapKeys[j].String() })
+	writeMapKeys := func(mapKeys []mapKey, trailC bool) {
 		for i, mapKey := range mapKeys {
-			val := eindirect(rv.MapIndex(mapKey))
+			val := eindirect(rv.MapIndex(mapKey.goKey))
 			if isNil(val) {
 				continue
 			}
 
 			if inline {
-				enc.writeKeyValue(Key{mapKey.String()}, val, true)
+				enc.writeKeyValue(Key{mapKey.key}, val, true)
 				if trailC || i != len(mapKeys)-1 {
 					enc.write(", ")
 				}
 			} else {
-				enc.encode(key.add(mapKey.String()), val)
+				enc.encode(key.add(mapKey.key), val)
 			}
 		}
 	}
