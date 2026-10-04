@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"math/big"
 	"os"
 	"reflect"
 	"strconv"
@@ -118,13 +119,35 @@ const (
 // This decoder does not handle cyclic types. Decode will not terminate if a
 // cyclic type is passed.
 type Decoder struct {
-	r        io.Reader
-	maxDepth int
+	r             io.Reader
+	maxDepth      int
+	strictNumbers bool
 }
 
 // NewDecoder creates a new Decoder.
 func NewDecoder(r io.Reader) *Decoder {
 	return &Decoder{r: r, maxDepth: 128}
+}
+
+// SetStrictNumbers enables or disables exact number mode.
+//
+// With exact number mode enabled, integers and floats decoded into an
+// any/interface are represented by [Number] values instead of int64 and
+// float64. A Number retains the original lexeme, the integer/float kind, the
+// sign of zero, and the inf/NaN specials, and finite decimals can be converted
+// exactly to [big.Rat].
+//
+// Integers are still subject to the TOML range requirement of signed 64-bit;
+// an out-of-range integer is a parse error. Finite floats of any magnitude are
+// accepted; converting one to float64 reports overflow or rounding via the
+// methods on [Number].
+//
+// Decoding into concrete Go types (int64, float64, *big.Int, *big.Rat,
+// *Number, ...) is available regardless of this setting; it only changes the
+// default type used behind interfaces. It returns the Decoder for chaining.
+func (dec *Decoder) SetStrictNumbers(on bool) *Decoder {
+	dec.strictNumbers = on
+	return dec
 }
 
 // MaxDepth sets the maximum table and array depth to prevent using an
@@ -137,6 +160,9 @@ var (
 	unmarshalToml = reflect.TypeOf((*Unmarshaler)(nil)).Elem()
 	unmarshalText = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
 	primitiveType = reflect.TypeOf((*Primitive)(nil)).Elem()
+	numberType    = reflect.TypeOf((*Number)(nil)).Elem()
+	bigIntType    = reflect.TypeOf((*big.Int)(nil)).Elem()
+	bigRatType    = reflect.TypeOf((*big.Rat)(nil)).Elem()
 )
 
 // Decode TOML data in to the pointer `v`.
@@ -171,7 +197,7 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		return MetaData{}, err
 	}
 
-	p, err := parse(string(data), dec.maxDepth)
+	p, err := parse(string(data), dec.maxDepth, dec.strictNumbers)
 	if err != nil {
 		return MetaData{}, err
 	}
@@ -261,6 +287,12 @@ func (md *MetaData) unify(data any, rv reflect.Value) error {
 		}
 		return nil
 	}
+	// Exact numeric destinations: available in both the default and exact
+	// number mode.
+	if handled, err := md.unifyNumeric(data, rv); handled {
+		return err
+	}
+
 	if v, ok := rvi.(encoding.TextUnmarshaler); ok {
 		return md.unifyText(data, v)
 	}
@@ -300,6 +332,99 @@ func (md *MetaData) unify(data any, rv reflect.Value) error {
 		return md.unifyFloat64(data, rv)
 	}
 	return md.e("unsupported type %s", rv.Kind())
+}
+
+// unifyNumeric handles the exact numeric destinations: *Number, *big.Int, and
+// *big.Rat. It reports handled==false for unrelated destination types.
+func (md *MetaData) unifyNumeric(data any, rv reflect.Value) (handled bool, err error) {
+	rt := rv.Type()
+	if rt.Kind() == reflect.Pointer {
+		rt = rt.Elem()
+	}
+
+	switch rt {
+	case numberType:
+		num, err := numberFromValue(data)
+		if err != nil {
+			return true, md.parseErr(err)
+		}
+		setValue(rv, reflect.ValueOf(num))
+		return true, nil
+	case bigIntType:
+		bi, err := bigIntFromValue(data)
+		if err != nil {
+			return true, md.parseErr(err)
+		}
+		setValue(rv, reflect.ValueOf(*bi))
+		return true, nil
+	case bigRatType:
+		br, err := bigRatFromValue(data)
+		if err != nil {
+			return true, md.parseErr(err)
+		}
+		setValue(rv, reflect.ValueOf(*br))
+		return true, nil
+	}
+	return false, nil
+}
+
+func setValue(rv reflect.Value, v reflect.Value) {
+	if rv.Kind() == reflect.Pointer {
+		rv.Elem().Set(v)
+		return
+	}
+	rv.Set(v)
+}
+
+// numberFromValue lifts any parser value representation into a Number. In the
+// default mode a float64 has already lost its exact lexical information, so the
+// Number is built from the shortest round-tripping decimal of that float64.
+func numberFromValue(data any) (Number, error) {
+	switch n := data.(type) {
+	case Number:
+		return n, nil
+	case int64:
+		return newIntegerNumber(strconv.FormatInt(n, 10)), nil
+	case float64:
+		switch {
+		case math.IsNaN(n):
+			return Number{kind: NumberFloat, lexeme: "nan", special: 'n', neg: math.Signbit(n)}, nil
+		case math.IsInf(n, 0):
+			return Number{kind: NumberFloat, lexeme: "inf", special: 'i', neg: math.Signbit(n)}, nil
+		default:
+			return newFloatNumber(strconv.FormatFloat(n, 'g', -1, 64), 0, false), nil
+		}
+	default:
+		return Number{}, &numberError{ErrNumberKind, fmt.Sprintf("cannot decode %s as toml.Number", fmtType(data))}
+	}
+}
+
+func bigIntFromValue(data any) (*big.Int, error) {
+	switch n := data.(type) {
+	case Number:
+		return n.BigInt()
+	case int64:
+		return big.NewInt(n), nil
+	default:
+		return nil, &numberError{ErrNumberKind, fmt.Sprintf("cannot decode %s as big.Int", fmtType(data))}
+	}
+}
+
+func bigRatFromValue(data any) (*big.Rat, error) {
+	switch n := data.(type) {
+	case Number:
+		return n.Rat()
+	case int64:
+		return new(big.Rat).SetInt64(n), nil
+	case float64:
+		r := new(big.Rat).SetFloat64(n)
+		if r == nil {
+			return nil, &numberError{ErrNumberSpecial, fmt.Sprintf("cannot decode %v as big.Rat", n)}
+		}
+		return r, nil
+	default:
+		return nil, &numberError{ErrNumberKind, fmt.Sprintf("cannot decode %s as big.Rat", fmtType(data))}
+	}
 }
 
 func (md *MetaData) unifyStruct(mapping any, rv reflect.Value) error {
@@ -438,6 +563,8 @@ func (md *MetaData) unifyString(data any, rv reflect.Value) error {
 			rv.SetString(strconv.FormatInt(i, 10))
 		} else if f, ok := data.(float64); ok {
 			rv.SetString(strconv.FormatFloat(f, 'g', -1, 64))
+		} else if n, ok := data.(Number); ok {
+			rv.SetString(n.canonical())
 		} else {
 			return md.badtype("string", data)
 		}
@@ -478,12 +605,30 @@ func (md *MetaData) unifyFloat64(data any, rv reflect.Value) error {
 		return nil
 	}
 
+	if num, ok := data.(Number); ok {
+		var (
+			f   float64
+			err error
+		)
+		if rvk == reflect.Float32 {
+			f32, ferr := num.Float32()
+			f, err = float64(f32), ferr
+		} else {
+			f, err = num.Float64()
+		}
+		if err != nil {
+			return md.parseErr(err)
+		}
+		rv.SetFloat(f)
+		return nil
+	}
+
 	return md.badtype("float", data)
 }
 
 func (md *MetaData) unifyInt(data any, rv reflect.Value) error {
-	_, ok := rv.Interface().(time.Duration)
-	if ok {
+	_, isDuration := rv.Interface().(time.Duration)
+	if isDuration {
 		// Parse as string duration, and fall back to regular integer parsing
 		// (as nanosecond) if this is not a string.
 		if s, ok := data.(string); ok {
@@ -496,7 +641,23 @@ func (md *MetaData) unifyInt(data any, rv reflect.Value) error {
 		}
 	}
 
-	num, ok := data.(int64)
+	var (
+		num int64
+		bi  *big.Int
+		ok  bool
+	)
+	switch n := data.(type) {
+	case int64:
+		num, ok = n, true
+	case Number:
+		v, err := n.BigInt()
+		if err != nil {
+			return md.parseErr(err)
+		}
+		bi, ok = v, true
+	default:
+		ok = false
+	}
 	if !ok {
 		return md.badtype("integer", data)
 	}
@@ -504,20 +665,89 @@ func (md *MetaData) unifyInt(data any, rv reflect.Value) error {
 	rvk := rv.Kind()
 	switch {
 	case rvk >= reflect.Int && rvk <= reflect.Int64:
-		if rv.OverflowInt(num) {
-			return md.parseErr(errParseRange{i: num, size: rvk.String()})
+		if bi != nil {
+			if !bigIntFits(bi, rvk) {
+				return md.parseErr(&numberError{ErrNumberOverflow, fmt.Sprintf("%s is out of range for %s", bi.String(), rvk)})
+			}
+			rv.SetInt(bi.Int64())
+		} else {
+			if rv.OverflowInt(num) {
+				return md.parseErr(errParseRange{i: num, size: rvk.String()})
+			}
+			rv.SetInt(num)
 		}
-		rv.SetInt(num)
 	case rvk >= reflect.Uint && rvk <= reflect.Uint64:
-		unum := uint64(num)
-		if num < 0 || rv.OverflowUint(unum) {
-			return md.parseErr(errParseRange{i: num, size: rvk.String()})
+		if bi != nil {
+			if bi.Sign() < 0 || !bigUintFits(bi, rvk) {
+				return md.parseErr(&numberError{ErrNumberOverflow, fmt.Sprintf("%s is out of range for %s", bi.String(), rvk)})
+			}
+			rv.SetUint(bi.Uint64())
+		} else {
+			unum := uint64(num)
+			if num < 0 || rv.OverflowUint(unum) {
+				return md.parseErr(errParseRange{i: num, size: rvk.String()})
+			}
+			rv.SetUint(unum)
 		}
-		rv.SetUint(unum)
 	default:
 		panic("unreachable")
 	}
 	return nil
+}
+
+func bigIntFits(bi *big.Int, k reflect.Kind) bool {
+	bits := intBits(k)
+	if bits == 0 {
+		return false
+	}
+	return bi.IsInt64() && (bits >= 64 || (bi.Int64() >= -(1<<(bits-1)) && bi.Int64() <= (1<<(bits-1))-1))
+}
+
+func bigUintFits(bi *big.Int, k reflect.Kind) bool {
+	bits := uintBits(k)
+	if bits == 0 {
+		return false
+	}
+	if !bi.IsUint64() {
+		return false
+	}
+	u := bi.Uint64()
+	if bits >= 64 {
+		return true
+	}
+	return u <= (uint64(1)<<bits)-1
+}
+
+func intBits(k reflect.Kind) int {
+	switch k {
+	case reflect.Int8:
+		return 8
+	case reflect.Int16:
+		return 16
+	case reflect.Int32:
+		return 32
+	case reflect.Int64:
+		return 64
+	case reflect.Int:
+		return strconv.IntSize
+	}
+	return 0
+}
+
+func uintBits(k reflect.Kind) int {
+	switch k {
+	case reflect.Uint8:
+		return 8
+	case reflect.Uint16:
+		return 16
+	case reflect.Uint32:
+		return 32
+	case reflect.Uint64:
+		return 64
+	case reflect.Uint:
+		return strconv.IntSize
+	}
+	return 0
 }
 
 func (md *MetaData) unifyBool(data any, rv reflect.Value) error {
@@ -558,6 +788,8 @@ func (md *MetaData) unifyText(data any, v encoding.TextUnmarshaler) error {
 		s = fmt.Sprintf("%d", sdata)
 	case float64:
 		s = strconv.FormatFloat(sdata, 'g', -1, 64)
+	case Number:
+		s = sdata.canonical()
 	default:
 		return md.badtype("primitive (string-like)", data)
 	}

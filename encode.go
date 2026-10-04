@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"reflect"
 	"sort"
 	"strconv"
@@ -127,14 +128,37 @@ func Marshal(v any) ([]byte, error) {
 // NOTE: only exported keys are encoded due to the use of reflection. Unexported
 // keys are silently discarded.
 type Encoder struct {
-	Indent     string // string for a single indentation level; default is two spaces.
-	hasWritten bool   // written any output to w yet?
-	w          *bufio.Writer
+	Indent      string // string for a single indentation level; default is two spaces.
+	NumberStyle NumberStyle
+	hasWritten  bool // written any output to w yet?
+	w           *bufio.Writer
 }
+
+// NumberStyle controls how [Number] values are encoded.
+type NumberStyle uint8
+
+const (
+	// NumberStyleCanonical writes a normalized, unambiguous decimal form; it
+	// preserves the integer/float kind, the sign of zero, and special values.
+	NumberStyleCanonical NumberStyle = iota
+	// NumberStyleLexical preserves the exact original lexeme of the Number.
+	NumberStyleLexical
+)
 
 // NewEncoder create a new Encoder.
 func NewEncoder(w io.Writer) *Encoder {
 	return &Encoder{w: bufio.NewWriter(w), Indent: "  "}
+}
+
+// SetNumberStyle sets how [Number] values are encoded and returns the Encoder
+// for chaining.
+//
+// The default [NumberStyleCanonical] outputs a normalized decimal value;
+// [NumberStyleLexical] reproduces the original lexeme. In both styles the
+// re-decoded value has the same integer/float kind and numeric semantics.
+func (enc *Encoder) SetNumberStyle(style NumberStyle) *Encoder {
+	enc.NumberStyle = style
+	return enc
 }
 
 // Encode writes a TOML representation of the Go value to the [Encoder]'s writer.
@@ -174,6 +198,12 @@ func (enc *Encoder) encode(key Key, rv reflect.Value) {
 		return
 	case rv.Type() == primitiveType: // TODO: #76 would make this superfluous after implemented.
 		enc.encode(key, reflect.ValueOf(rv.Interface().(Primitive).undecoded))
+		return
+	case rv.Type() == numberType:
+		enc.writeKeyValue(key, rv, false)
+		return
+	case rv.Type() == bigIntType || rv.Type() == bigRatType:
+		enc.writeKeyValue(key, rv, false)
 		return
 	}
 
@@ -265,6 +295,24 @@ func (enc *Encoder) eElement(rv reflect.Value) {
 			return
 		}
 		encPanic(fmt.Errorf("unable to convert %q to int64 or float64", n))
+	case Number:
+		if enc.NumberStyle == NumberStyleLexical {
+			enc.write(v.Lexeme())
+		} else {
+			enc.write(v.canonical())
+		}
+		return
+	case big.Int:
+		enc.write(v.String())
+		return
+	case big.Rat:
+		if s, ok := decimalFromRat(&v); ok {
+			enc.write(s)
+		} else {
+			f, _ := v.Float64()
+			enc.write(floatAddDecimal(strconv.FormatFloat(f, 'g', -1, 64)))
+		}
+		return
 	}
 
 	switch rv.Kind() {
@@ -569,6 +617,24 @@ func tomlTypeOfGo(rv reflect.Value) tomlType {
 	if rv.Kind() == reflect.Struct {
 		if rv.Type() == timeType {
 			return tomlDatetime
+		}
+		if rv.Type() == numberType {
+			// Unexported embedded structs reach here without an addressable,
+			// interface-able value; they are discarded later, so any type is
+			// fine.
+			if !rv.CanInterface() {
+				return tomlFloat
+			}
+			if rv.Interface().(Number).Kind() == NumberInteger {
+				return tomlInteger
+			}
+			return tomlFloat
+		}
+		if rv.Type() == bigIntType {
+			return tomlInteger
+		}
+		if rv.Type() == bigRatType {
+			return tomlFloat
 		}
 		if isMarshaler(rv) {
 			return tomlString

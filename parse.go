@@ -3,6 +3,7 @@ package toml
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -12,12 +13,13 @@ import (
 )
 
 type parser struct {
-	lx         *lexer
-	maxDepth   int
-	arrDepth   int
-	context    Key      // Full key for the current hash in scope.
-	currentKey string   // Base key name for everything except hashes.
-	pos        Position // Current position in the TOML file.
+	lx           *lexer
+	maxDepth     int
+	arrDepth     int
+	exactNumbers bool
+	context      Key      // Full key for the current hash in scope.
+	currentKey   string   // Base key name for everything except hashes.
+	pos          Position // Current position in the TOML file.
 
 	ordered   []Key               // List of keys in the order that they appear in the TOML data.
 	keyInfo   map[string]keyInfo  // Map keyname → info about the TOML key.
@@ -30,7 +32,7 @@ type keyInfo struct {
 	tomlType tomlType
 }
 
-func parse(data string, maxDepth int) (p *parser, err error) {
+func parse(data string, maxDepth int, exactNumbers bool) (p *parser, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if pErr, ok := r.(ParseError); ok {
@@ -64,12 +66,13 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 	}
 
 	p = &parser{
-		lx:        lex(data),
-		maxDepth:  maxDepth,
-		keyInfo:   make(map[string]keyInfo),
-		mapping:   make(map[string]any),
-		ordered:   make([]Key, 0),
-		implicits: make(map[string]struct{}),
+		lx:           lex(data),
+		maxDepth:     maxDepth,
+		exactNumbers: exactNumbers,
+		keyInfo:      make(map[string]keyInfo),
+		mapping:      make(map[string]any),
+		ordered:      make([]Key, 0),
+		implicits:    make(map[string]struct{}),
 	}
 	for {
 		item := p.next()
@@ -274,31 +277,112 @@ func (p *parser) value(it item, parentIsArray bool) (any, tomlType) {
 }
 
 func (p *parser) valueInteger(it item) (any, tomlType) {
-	if !numUnderscoresOK(it.val) {
-		p.panicItemf(it, "Invalid integer %q: underscores must be surrounded by digits", it.val)
-	}
-	if numHasLeadingZero(it.val) {
-		p.panicItemf(it, "Invalid integer %q: cannot have leading zeroes", it.val)
-	}
-
-	num, err := strconv.ParseInt(it.val, 0, 64)
+	num, err := parseIntegerLexeme(it.val)
 	if err != nil {
-		// Distinguish integer values. Normally, it'd be a bug if the lexer
-		// provides an invalid integer, but it's possible that the number is
-		// out of range of valid values (which the lexer cannot determine).
-		// So mark the former as a bug but the latter as a legitimate user
-		// error.
 		if e, ok := err.(*strconv.NumError); ok && e.Err == strconv.ErrRange {
 			p.panicErr(it, errParseRange{i: it.val, size: "int64"})
-		} else {
-			p.bug("Expected integer value, but got '%s'.", it.val)
 		}
+		if ne, ok := err.(*numberError); ok {
+			p.panicItemf(it, "Invalid integer %q: %s", it.val, ne.Error())
+		}
+		p.bug("Expected integer value, but got '%s'.", it.val)
+	}
+	if p.exactNumbers {
+		return newIntegerNumber(it.val), p.typeOfPrimitive(it)
 	}
 	return num, p.typeOfPrimitive(it)
 }
 
+// parseIntegerLexeme validates a TOML integer lexeme and returns its int64
+// value. Validation (underscores, leading zeroes, base prefixes) is done here
+// rather than trusting strconv/big.Int, whose parsers accept a wider grammar.
+func parseIntegerLexeme(lex string) (int64, error) {
+	if !numUnderscoresOK(lex) {
+		return 0, &numberError{ErrNumberKind, "underscores must be surrounded by digits"}
+	}
+	if numHasLeadingZero(lex) {
+		return 0, &numberError{ErrNumberKind, "cannot have leading zeroes"}
+	}
+
+	num, err := strconv.ParseInt(lex, 0, 64)
+	if err != nil {
+		return 0, err
+	}
+	return num, nil
+}
+
+// newIntegerNumber builds an exact Number from a validated integer lexeme.
+// Non-decimal prefixes are converted to a decimal big.Rat.
+func newIntegerNumber(lex string) Number {
+	decimal := lex
+	if isBasePrefixed(lex) {
+		sign := ""
+		v := lex
+		if v[0] == '+' || v[0] == '-' {
+			sign = string(v[0])
+			v = v[1:]
+		}
+		base := 0
+		switch v[1] {
+		case 'b':
+			base = 2
+		case 'o':
+			base = 8
+		case 'x':
+			base = 16
+		}
+		digits := strings.ReplaceAll(v[2:], "_", "")
+		bi, _ := new(big.Int).SetString(digits, base)
+		decimal = sign + bi.String()
+	}
+
+	rat, err := parseDecimalRat(decimal)
+	if err != nil {
+		panic("toml: internal error: validated integer lexeme failed exact parse: " + lex)
+	}
+	return Number{kind: NumberInteger, lexeme: lex, rat: rat}
+}
+
+func isBasePrefixed(lex string) bool {
+	v := lex
+	if len(v) > 1 && (v[0] == '+' || v[0] == '-') {
+		v = v[1:]
+	}
+	return len(v) >= 2 && v[0] == '0' && (v[1] == 'b' || v[1] == 'o' || v[1] == 'x')
+}
+
 func (p *parser) valueFloat(it item) (any, tomlType) {
-	parts := strings.FieldsFunc(it.val, func(r rune) bool {
+	num, special, neg, err := parseFloatLexeme(it.val)
+	if err != nil {
+		if e, ok := err.(*strconv.NumError); ok && e.Err == strconv.ErrRange {
+			if p.exactNumbers {
+				return newFloatNumber(it.val, special, neg), p.typeOfPrimitive(it)
+			}
+			p.panicErr(it, errParseRange{i: it.val, size: "float64"})
+		}
+		if ne, ok := err.(*numberError); ok {
+			p.panicItemf(it, "%s", ne.Error())
+		}
+		p.panicItemf(it, "Invalid float value: %q", it.val)
+	}
+	if p.exactNumbers {
+		return newFloatNumber(it.val, special, neg), p.typeOfPrimitive(it)
+	}
+	if special == 'n' && neg {
+		num = math.Copysign(num, -1)
+	}
+	return num, p.typeOfPrimitive(it)
+}
+
+// parseFloatLexeme validates a TOML float lexeme and parses it as float64.
+//
+// special is 'i' for inf, 'n' for NaN, or 0 for finite values; neg records the
+// sign for inf/NaN (ParseFloat already honors the sign of finite values).
+//
+// Out-of-range finite values return strconv.ErrRange with num set to the
+// +/-Inf result, so callers that retain exact values can still accept them.
+func parseFloatLexeme(lex string) (num float64, special byte, neg bool, err error) {
+	parts := strings.FieldsFunc(lex, func(r rune) bool {
 		switch r {
 		case '.', 'e', 'E':
 			return true
@@ -307,37 +391,51 @@ func (p *parser) valueFloat(it item) (any, tomlType) {
 	})
 	for _, part := range parts {
 		if !numUnderscoresOK(part) {
-			p.panicItemf(it, "Invalid float %q: underscores must be surrounded by digits", it.val)
+			return 0, 0, false, &numberError{ErrNumberKind, fmt.Sprintf("Invalid float %q: underscores must be surrounded by digits", lex)}
 		}
 	}
 	if len(parts) > 0 && numHasLeadingZero(parts[0]) {
-		p.panicItemf(it, "Invalid float %q: cannot have leading zeroes", it.val)
+		return 0, 0, false, &numberError{ErrNumberKind, fmt.Sprintf("Invalid float %q: cannot have leading zeroes", lex)}
 	}
-	if !numPeriodsOK(it.val) {
-		// As a special case, numbers like '123.' or '1.e2',
-		// which are valid as far as Go/strconv are concerned,
-		// must be rejected because TOML says that a fractional
-		// part consists of '.' followed by 1+ digits.
-		p.panicItemf(it, "Invalid float %q: '.' must be followed by one or more digits", it.val)
+	if !numPeriodsOK(lex) {
+		// As a special case, numbers like '123.' or '1.e2', which are valid as
+		// far as Go/strconv are concerned, must be rejected because TOML says
+		// that a fractional part consists of '.' followed by 1+ digits.
+		return 0, 0, false, &numberError{ErrNumberKind, fmt.Sprintf("Invalid float %q: '.' must be followed by one or more digits", lex)}
 	}
-	val := strings.Replace(it.val, "_", "", -1)
-	signbit := false
-	if val == "+nan" || val == "-nan" {
-		signbit = val == "-nan"
-		val = "nan"
+
+	val := strings.Replace(lex, "_", "", -1)
+	switch val {
+	case "nan":
+		return math.NaN(), 'n', false, nil
+	case "+nan":
+		return math.NaN(), 'n', false, nil
+	case "-nan":
+		return math.NaN(), 'n', true, nil
+	case "inf", "+inf":
+		return math.Inf(1), 'i', false, nil
+	case "-inf":
+		return math.Inf(-1), 'i', true, nil
 	}
-	num, err := strconv.ParseFloat(val, 64)
-	if err != nil {
-		if e, ok := err.(*strconv.NumError); ok && e.Err == strconv.ErrRange {
-			p.panicErr(it, errParseRange{i: it.val, size: "float64"})
-		} else {
-			p.panicItemf(it, "Invalid float value: %q", it.val)
+
+	num, perr := strconv.ParseFloat(val, 64)
+	if perr != nil {
+		return num, 0, false, perr
+	}
+	return num, 0, false, nil
+}
+
+// newFloatNumber builds an exact Number from a validated float lexeme.
+func newFloatNumber(lex string, special byte, neg bool) Number {
+	n := Number{kind: NumberFloat, lexeme: lex, special: special, neg: neg}
+	if special == 0 {
+		rat, err := parseDecimalRat(lex)
+		if err != nil {
+			panic("toml: internal error: validated float lexeme failed exact parse: " + lex)
 		}
+		n.rat = rat
 	}
-	if signbit {
-		num = math.Copysign(num, -1)
-	}
-	return num, p.typeOfPrimitive(it)
+	return n
 }
 
 var dtTypes = []struct {
